@@ -5,7 +5,7 @@ use crate::{
 };
 use byteorder::{ReadBytesExt, LE};
 use std::marker::PhantomData;
-use std::{io::Read, usize};
+use std::io::Read;
 
 pub struct VertexReader<R> {
   pub settings: Settings,

@@ -6,7 +6,7 @@ use crate::{
 use byteorder::{ReadBytesExt, LE};
 use enumflags2::BitFlags;
 use std::marker::PhantomData;
-use std::{io::Read, usize};
+use std::io::Read;
 
 pub struct BoneReader<R> {
   pub settings: Settings,
