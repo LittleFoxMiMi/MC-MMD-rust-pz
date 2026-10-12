@@ -35,11 +35,15 @@ pub struct MMDPhysics {
     // --- 预分配缓冲区（避免每帧堆分配） ---
     /// 动态刚体关联的骨骼索引集合（构建时计算一次）
     dynamic_bone_indices: HashSet<usize>,
+    rotation_only_bone_indices: HashSet<usize>,
     /// 动态骨骼变换结果缓冲区（复用内存）
     dynamic_bone_buf: Vec<(usize, Mat4)>,
 
     /// 上一帧模型世界位置（用于计算移动速度实现惯性）
     prev_model_position: Option<Vec3>,
+    prev_model_velocity: Vec3,
+    /// 等待下一帧完成动画/IK后，按当前姿态初始化动态体。
+    needs_initialize: bool,
 }
 
 impl MMDPhysics {
@@ -63,8 +67,11 @@ impl MMDPhysics {
             fps: config.physics_fps,
             max_substep_count: config.max_substep_count,
             dynamic_bone_indices: HashSet::new(),
+            rotation_only_bone_indices: HashSet::new(),
             dynamic_bone_buf: Vec::new(),
             prev_model_position: None,
+            prev_model_velocity: Vec3::ZERO,
+            needs_initialize: true,
         })
     }
 
@@ -160,12 +167,25 @@ impl MMDPhysics {
         }
 
         // 第四步：预计算动态骨骼索引集合（一次性，避免每帧重算）
-        self.dynamic_bone_indices = self
-            .rigid_bodies
-            .iter()
-            .filter(|rb| rb.physics_mode != PhysicsMode::FollowBone && rb.bone_index >= 0)
-            .map(|rb| rb.bone_index as usize)
-            .collect();
+        self.dynamic_bone_indices.clear();
+        self.rotation_only_bone_indices.clear();
+        for rb in &self.rigid_bodies {
+            if rb.physics_mode == PhysicsMode::FollowBone
+                || rb.bone_index < 0
+                || rb.bone_index as usize >= bone_transforms.len()
+                || rb.bullet_body.is_none()
+            {
+                continue;
+            }
+            let index = rb.bone_index as usize;
+            self.dynamic_bone_indices.insert(index);
+            // 多刚体映射同一骨骼时，与后面的变换读取顺序一致，最后一个生效。
+            if rb.physics_mode == PhysicsMode::PhysicsWithBone {
+                self.rotation_only_bone_indices.insert(index);
+            } else {
+                self.rotation_only_bone_indices.remove(&index);
+            }
+        }
 
         // 预分配动态骨骼缓冲区
         self.dynamic_bone_buf
@@ -214,13 +234,8 @@ impl MMDPhysics {
         }
     }
 
-    /// 同步运动学刚体并传递模型移动速度（实现惯性）
-    ///
-    /// 原理：物理在模型局部空间运行，角色世界移动对物理不可见。
-    /// 第一步：同步 FollowBone 刚体到骨骼位置。
-    /// 第二步：计算模型世界速度，转换到物理空间后取反，
-    ///        对动态刚体施加 F = m * (-v_local) / dt，
-    ///        产生与移动方向相反的惯性力（头发/裙子自然后拽）。
+    /// 同步身体碰撞体，按世界速度变化传递移动惯性。
+    /// J = -m * Δv：匀速不持续施力，急停仍保留惯性，不依赖渲染帧率。
     pub fn sync_bodies_with_model_velocity(
         &mut self,
         bone_transforms: &[Mat4],
@@ -228,63 +243,45 @@ impl MMDPhysics {
         model_transform: Mat4,
         config: &PhysicsConfig,
     ) {
-        let dt = delta_time.max(0.001);
-        let curr_pos = model_transform.w_axis.truncate();
-
-        // 计算模型世界速度
-        let model_velocity = if let Some(prev_pos) = self.prev_model_position {
-            (curr_pos - prev_pos) / dt
-        } else {
-            Vec3::ZERO
-        };
-        self.prev_model_position = Some(curr_pos);
-
-        // 第一步：同步运动学刚体位置
+        if self.needs_initialize {
+            self.initialize(bone_transforms);
+        }
         self.sync_bodies(bone_transforms);
-
-        // 第二步：给动态刚体施加惯性力
-        if config.inertia_strength > 0.0 && model_velocity.length_squared() > 1e-8 {
-            // 钳制世界速度（20 blocks/s 覆盖疾跑+速度药水，超出视为传送）
-            let speed_sq = model_velocity.length_squared();
-            let max_speed = 20.0_f32;
-            let world_vel = if speed_sq > max_speed * max_speed {
-                model_velocity * (max_speed / speed_sq.sqrt())
-            } else {
-                model_velocity
-            };
-
-            // 世界速度 → 模型局部空间（R^T * v_world）
-            let rot_inv = Mat3::from_mat4(model_transform).transpose();
-            let local_vel = rot_inv * world_vel;
-
-            // 模型局部空间惯性（Z-flip 坐标系中 Z 方向需取反）
-            let inertia_vel = Vec3::new(
-                -local_vel.x * config.inertia_strength,
-                -local_vel.y * config.inertia_strength,
-                local_vel.z * config.inertia_strength,
-            );
-
-            // 最大加速度 = max_linear_velocity * physics_fps
-            // 确保单个物理子步内速度增量不超过 max_linear_velocity
-            let max_accel = config.max_linear_velocity * self.fps;
-
-            // F = m * v / dt，再钳制力大小防止衣服拉伸
-            for rb_data in &self.rigid_bodies {
-                if rb_data.physics_mode == PhysicsMode::FollowBone {
-                    continue;
-                }
-                if let Some(ref body) = rb_data.bullet_body {
-                    let mass = body.get_mass();
-                    if mass > 0.0 {
-                        let mut force = inertia_vel * mass / dt;
-                        // 钳制力：限制加速度上限
-                        let max_force = max_accel * mass;
-                        let force_sq = force.length_squared();
-                        if force_sq > max_force * max_force {
-                            force *= max_force / force_sq.sqrt();
-                        }
-                        body.apply_central_force(force.x, force.y, force.z);
-                    }
+        let curr_pos = model_transform.w_axis.truncate();
+        if !delta_time.is_finite() || delta_time <= 0.0 {
+            if self.prev_model_position.is_none() {
+                self.prev_model_position = Some(curr_pos);
+            }
+            return;
+        }
+        let velocity = self
+            .prev_model_position
+            .map(|p| (curr_pos - p) / delta_time)
+            .unwrap_or(Vec3::ZERO);
+        self.prev_model_position = Some(curr_pos);
+        // 超过旧速度阈值视为传送，不把位置跳变当作猛烈加速。
+        if !velocity.is_finite() || velocity.length_squared() > 20.0 * 20.0 {
+            self.prev_model_velocity = Vec3::ZERO;
+            return;
+        }
+        let delta_velocity = velocity - self.prev_model_velocity;
+        self.prev_model_velocity = velocity;
+        if config.inertia_strength <= 0.0 || delta_velocity.length_squared() < 1e-8 {
+            return;
+        }
+        let local_delta = Mat3::from_mat4(model_transform).transpose() * delta_velocity;
+        // 世界速度增量 → 模型局部 → Bullet 左手坐标，方向取反。
+        let response =
+            Vec3::new(-local_delta.x, -local_delta.y, local_delta.z) * config.inertia_strength;
+        let response = response.clamp_length_max(config.max_linear_velocity);
+        for rb in &self.rigid_bodies {
+            if rb.physics_mode == PhysicsMode::FollowBone {
+                continue;
+            }
+            if let Some(ref body) = rb.bullet_body {
+                let mass = body.get_mass();
+                if mass > 0.0 {
+                    body.apply_central_impulse(response * mass);
                 }
             }
         }
@@ -327,57 +324,30 @@ impl MMDPhysics {
         }
     }
 
-    /// 将动态刚体变换同步回骨骼（babylon-mmd syncBones）
-    ///
-    /// 从 Bullet3 读取左手空间变换，通过 inv_z 转回右手空间写入骨骼。
-    pub fn sync_bones(&self, bone_transforms: &mut [Mat4]) {
-        for rb_data in &self.rigid_bodies {
-            if rb_data.physics_mode == PhysicsMode::FollowBone {
-                continue;
-            }
-            let bone_idx = rb_data.bone_index;
-            if bone_idx < 0 || (bone_idx as usize) >= bone_transforms.len() {
-                continue;
-            }
-            if let Some(ref body) = rb_data.bullet_body {
-                let rb_matrix = body.get_transform();
-                let new_bone_left = match rb_data.physics_mode {
-                    PhysicsMode::Physics => rb_data.compute_bone_matrix(rb_matrix),
-                    PhysicsMode::PhysicsWithBone => {
-                        // 骨骼位置(右手) → inv_z → 左手
-                        let bone_right = bone_transforms[bone_idx as usize];
-                        let pos_left = Vec3::new(
-                            bone_right.w_axis.x,
-                            bone_right.w_axis.y,
-                            -bone_right.w_axis.z,
-                        );
-                        rb_data.compute_bone_matrix_rotation_only(rb_matrix, pos_left)
-                    }
-                    PhysicsMode::FollowBone => unreachable!(),
-                };
-                // 左手 → inv_z → 右手
-                bone_transforms[bone_idx as usize] = super::inv_z(new_bone_left);
-            }
-        }
+    /// 将物理结果按骨骼父链同步回骨骼，模式 2 仅驱动旋转。
+    pub fn sync_bones(&mut self, bones: &mut crate::skeleton::BoneSet) {
+        bones.set_physics_bone_indices(&self.dynamic_bone_indices);
+        let (transforms, rotation_only) = self.get_dynamic_bone_transforms(bones.bone_count());
+        bones.apply_physics_transforms(transforms, rotation_only);
     }
 
     /// 初始化物理（commitBodyStates 的初始版本）
     ///
     /// 在骨骼初始姿态确定后调用，将所有刚体设置到正确的初始位置（左手空间）。
     pub fn initialize(&mut self, bone_transforms: &[Mat4]) {
+        self.needs_initialize = false;
+        self.prev_model_position = None;
+        self.prev_model_velocity = Vec3::ZERO;
         for rb_data in &self.rigid_bodies {
             let bone_idx = rb_data.bone_index;
-            if bone_idx < 0 || (bone_idx as usize) >= bone_transforms.len() {
-                continue;
-            }
             if let Some(ref body) = rb_data.bullet_body {
-                // 骨骼(右手) → inv_z → 左手
-                let bone_left = super::inv_z(bone_transforms[bone_idx as usize]);
-                let body_matrix = rb_data.compute_body_matrix(bone_left);
-                body.set_transform(body_matrix);
-                body.set_linear_velocity(0.0, 0.0, 0.0);
-                body.set_angular_velocity(0.0, 0.0, 0.0);
-                body.clear_forces();
+                let body_matrix = if bone_idx >= 0 && (bone_idx as usize) < bone_transforms.len() {
+                    let bone_left = super::inv_z(bone_transforms[bone_idx as usize]);
+                    rb_data.compute_body_matrix(bone_left)
+                } else {
+                    rb_data.initial_transform
+                };
+                body.reset_transform(body_matrix);
             }
         }
     }
@@ -385,14 +355,8 @@ impl MMDPhysics {
     /// 重置物理系统
     pub fn reset(&mut self) {
         self.prev_model_position = None;
-        for rb_data in &self.rigid_bodies {
-            if let Some(ref body) = rb_data.bullet_body {
-                body.set_transform(rb_data.initial_transform);
-                body.set_linear_velocity(0.0, 0.0, 0.0);
-                body.set_angular_velocity(0.0, 0.0, 0.0);
-                body.clear_forces();
-            }
-        }
+        self.prev_model_velocity = Vec3::ZERO;
+        self.needs_initialize = true;
     }
 
     /// 设置重力
@@ -412,37 +376,25 @@ impl MMDPhysics {
     /// 从 Bullet3 读取左手空间变换，通过 inv_z 转回右手空间返回。
     pub fn get_dynamic_bone_transforms(
         &mut self,
-        current_bone_transforms: &[Mat4],
-    ) -> &[(usize, Mat4)] {
+        bone_count: usize,
+    ) -> (&[(usize, Mat4)], &HashSet<usize>) {
         self.dynamic_bone_buf.clear();
         for rb_data in &self.rigid_bodies {
             if rb_data.physics_mode == PhysicsMode::FollowBone {
                 continue;
             }
             let bone_idx = rb_data.bone_index;
-            if bone_idx < 0 || (bone_idx as usize) >= current_bone_transforms.len() {
+            if bone_idx < 0 || (bone_idx as usize) >= bone_count {
                 continue;
             }
             if let Some(ref body) = rb_data.bullet_body {
                 let rb_matrix = body.get_transform();
-                let new_bone_left = match rb_data.physics_mode {
-                    PhysicsMode::Physics => rb_data.compute_bone_matrix(rb_matrix),
-                    PhysicsMode::PhysicsWithBone => {
-                        let bone_right = current_bone_transforms[bone_idx as usize];
-                        let pos_left = Vec3::new(
-                            bone_right.w_axis.x,
-                            bone_right.w_axis.y,
-                            -bone_right.w_axis.z,
-                        );
-                        rb_data.compute_bone_matrix_rotation_only(rb_matrix, pos_left)
-                    }
-                    PhysicsMode::FollowBone => unreachable!(),
-                };
+                let new_bone_left = rb_data.compute_bone_matrix(rb_matrix);
                 self.dynamic_bone_buf
                     .push((bone_idx as usize, super::inv_z(new_bone_left)));
             }
         }
-        &self.dynamic_bone_buf
+        (&self.dynamic_bone_buf, &self.rotation_only_bone_indices)
     }
 
     /// 获取动态骨骼索引集合的引用（构建时已预计算，零分配）

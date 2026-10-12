@@ -2387,7 +2387,7 @@ impl MmdModel {
             &self.joints,
             &self.physics_bone_transforms_buf,
         );
-        physics.initialize(&self.physics_bone_transforms_buf);
+        // bind 姿态只用于建立刚体偏移；动态体在首帧动画完成后再对齐。
 
         self.physics = Some(physics);
         self.physics_enabled = true;
@@ -2403,6 +2403,9 @@ impl MmdModel {
 
     /// 启用/禁用物理
     pub fn set_physics_enabled(&mut self, enabled: bool) {
+        if enabled && !self.physics_enabled {
+            self.reset_physics();
+        }
         self.physics_enabled = enabled;
     }
 
@@ -2425,6 +2428,7 @@ impl MmdModel {
 
         // 全局开关 + per-model 开关双重检查
         if !config.enabled || !self.physics_enabled || self.physics.is_none() {
+            self.reset_physics();
             return;
         }
 
@@ -2453,19 +2457,7 @@ impl MmdModel {
         physics.step_simulation(delta_time, &config);
 
         // 3. 同步物理结果回骨骼（复用内部缓冲区）
-        let dynamic_bone_transforms =
-            physics.get_dynamic_bone_transforms(&self.physics_bone_transforms_buf);
-
-        for &(bone_idx, transform) in dynamic_bone_transforms {
-            self.bone_manager
-                .set_global_transform_physics(bone_idx, transform);
-        }
-
-        let physics_bone_indices = physics.get_dynamic_bone_indices();
-        self.bone_manager
-            .set_physics_bone_indices(physics_bone_indices);
-        self.bone_manager
-            .update_non_physics_children(physics_bone_indices);
+        physics.sync_bones(&mut self.bone_manager);
 
         // 归还所有权
         self.physics = Some(physics);

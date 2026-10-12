@@ -33,6 +33,9 @@ pub struct BoneSet {
     /// 子骨骼缓存（parent_index -> children_indices）
     children_cache: Vec<Vec<usize>>,
 
+    /// 真正的父先子后顺序，不受 PMX 变形层级影响。
+    hierarchy_indices: Vec<usize>,
+
     /// 更新标志
     needs_hierarchy_update: bool,
 
@@ -51,6 +54,7 @@ impl BoneSet {
             skinning_matrices: Vec::new(),
             physics_bone_indices: HashSet::new(),
             children_cache: Vec::new(),
+            hierarchy_indices: Vec::new(),
             needs_hierarchy_update: true,
             is_vrm: false,
         }
@@ -160,6 +164,19 @@ impl BoneSet {
                 self.children_cache[parent_idx as usize].push(i);
                 self.links[parent_idx as usize].is_leaf = false;
             }
+        }
+        self.hierarchy_indices.clear();
+        for i in 0..bone_count {
+            let p = self.links[i].parent_index;
+            if p < 0 || p as usize >= bone_count {
+                self.hierarchy_indices.push(i);
+            }
+        }
+        let mut cursor = 0;
+        while cursor < self.hierarchy_indices.len() {
+            let parent = self.hierarchy_indices[cursor];
+            self.hierarchy_indices.extend_from_slice(&self.children_cache[parent]);
+            cursor += 1;
         }
     }
 
@@ -590,6 +607,39 @@ impl BoneSet {
         self.links[index].animation_translate = translation - self.links[index].body_shift;
     }
 
+    /// 按父链合并物理结果。模式 2 保留动画局部位置，随物理父节点移动，
+    /// 模式 1 则保留 Bullet 世界位置。最后才反算局部旋转，避免读到旧父矩阵。
+    pub fn apply_physics_transforms(
+        &mut self,
+        transforms: &[(usize, Mat4)],
+        rotation_only: &HashSet<usize>,
+    ) {
+        // 动画 local_to_parent 此时保持完整，先只写世界矩阵。
+        for &(index, transform) in transforms {
+            if index < self.links.len() {
+                self.links[index].local_to_world = transform;
+            }
+        }
+        for &index in &self.hierarchy_indices {
+            let p = self.links[index].parent_index;
+            let inherited = if p >= 0 && (p as usize) < self.links.len() {
+                self.links[p as usize].local_to_world * self.links[index].local_to_parent
+            } else {
+                self.links[index].local_to_parent
+            };
+            if rotation_only.contains(&index) {
+                self.links[index].local_to_world.w_axis = inherited.w_axis;
+            } else if !self.physics_bone_indices.contains(&index) {
+                self.links[index].local_to_world = inherited;
+            }
+        }
+        for &(index, _) in transforms {
+            if index < self.links.len() {
+                self.set_global_transform_physics(index, self.links[index].local_to_world);
+            }
+        }
+    }
+
     /// 更新单个骨骼的全局变换（VR IK 用：头部旋转后刷新子骨骼链）
     pub fn update_single_bone_global(&mut self, index: usize) {
         if index >= self.links.len() {
@@ -725,6 +775,7 @@ impl BoneSet {
         total +=
             (self.name_to_index.capacity() * (size_of::<String>() + size_of::<usize>())) as u64;
         total += (self.sorted_indices.capacity() * size_of::<usize>()) as u64;
+        total += (self.hierarchy_indices.capacity() * size_of::<usize>()) as u64;
         total += (self.ik_solvers.capacity() * size_of::<IkSolver>()) as u64;
         total += (self.skinning_matrices.capacity() * size_of::<Mat4>()) as u64;
         total += (self.physics_bone_indices.capacity() * size_of::<usize>()) as u64;

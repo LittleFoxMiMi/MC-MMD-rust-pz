@@ -80,6 +80,8 @@ BW_RigidBody* bw_rigid_body_create(const BW_RigidBodyInfo* info);
 void bw_rigid_body_destroy(BW_RigidBody* rb);
 void bw_rigid_body_get_transform(BW_RigidBody* rb, float* matrix4x4);
 void bw_rigid_body_set_transform(BW_RigidBody* rb, const float* matrix4x4);
+void bw_rigid_body_reset_transform(BW_RigidBody* rb, const float* matrix4x4);
+void bw_rigid_body_apply_central_impulse(BW_RigidBody* rb, float x, float y, float z);
 void bw_rigid_body_get_position(BW_RigidBody* rb, float* x, float* y, float* z);
 void bw_rigid_body_get_rotation(BW_RigidBody* rb, float* x, float* y, float* z, float* w);
 void bw_rigid_body_set_linear_velocity(BW_RigidBody* rb, float x, float y, float z);

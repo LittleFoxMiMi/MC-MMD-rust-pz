@@ -295,6 +295,23 @@ void bw_rigid_body_set_transform(BW_RigidBody* rb, const float* matrix4x4) {
     body->getMotionState()->setWorldTransform(t);
 }
 
+// Teleport/reset must also discard interpolation from the preceding pose.
+// Keep normal kinematic updates separate so Bullet can derive their velocity.
+void bw_rigid_body_reset_transform(BW_RigidBody* rb, const float* matrix4x4) {
+    if (!rb || !matrix4x4) return;
+    btRigidBody* body = (btRigidBody*)rb;
+    btTransform t = mat4_to_bt(matrix4x4);
+    body->setCenterOfMassTransform(t);
+    body->setInterpolationWorldTransform(t);
+    body->setLinearVelocity(btVector3(0, 0, 0));
+    body->setAngularVelocity(btVector3(0, 0, 0));
+    body->setInterpolationLinearVelocity(btVector3(0, 0, 0));
+    body->setInterpolationAngularVelocity(btVector3(0, 0, 0));
+    body->clearForces();
+    body->getMotionState()->setWorldTransform(t);
+    body->activate(true);
+}
+
 void bw_rigid_body_get_position(BW_RigidBody* rb, float* x, float* y, float* z) {
     if (!rb) return;
     btRigidBody* body = (btRigidBody*)rb;
@@ -408,6 +425,13 @@ void bw_rigid_body_apply_central_force(BW_RigidBody* rb, float x, float y, float
     if (!rb) return;
     btRigidBody* body = (btRigidBody*)rb;
     body->applyCentralForce(btVector3(x, y, z));
+}
+
+void bw_rigid_body_apply_central_impulse(BW_RigidBody* rb, float x, float y, float z) {
+    if (!rb) return;
+    btRigidBody* body = (btRigidBody*)rb;
+    body->applyCentralImpulse(btVector3(x, y, z));
+    body->activate(true);
 }
 
 /* ===== 6DOF 弹簧约束 ===== */

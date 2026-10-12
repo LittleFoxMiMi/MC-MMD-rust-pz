@@ -93,6 +93,8 @@ mod ffi {
         pub fn bw_rigid_body_destroy(rb: *mut BW_RigidBody);
         pub fn bw_rigid_body_get_transform(rb: *mut BW_RigidBody, matrix4x4: *mut c_float);
         pub fn bw_rigid_body_set_transform(rb: *mut BW_RigidBody, matrix4x4: *const c_float);
+        pub fn bw_rigid_body_reset_transform(rb: *mut BW_RigidBody, matrix4x4: *const c_float);
+        pub fn bw_rigid_body_apply_central_impulse(rb: *mut BW_RigidBody, x: c_float, y: c_float, z: c_float);
         pub fn bw_rigid_body_get_position(
             rb: *mut BW_RigidBody,
             x: *mut c_float,
@@ -363,6 +365,17 @@ impl BulletRigidBody {
     pub fn set_transform(&self, transform: Mat4) {
         let m = mat4_to_col_major(transform);
         unsafe { ffi::bw_rigid_body_set_transform(self.ptr, m.as_ptr()) }
+    }
+
+    /// 按当前姿态重置，同时清除速度、力和 Bullet 插值历史。
+    pub fn reset_transform(&self, transform: Mat4) {
+        let m = mat4_to_col_major(transform);
+        unsafe { ffi::bw_rigid_body_reset_transform(self.ptr, m.as_ptr()) }
+    }
+
+    /// 直接传递速度变化，避免高渲染帧率下未发生物理子步时丢失惯性力。
+    pub fn apply_central_impulse(&self, impulse: glam::Vec3) {
+        unsafe { ffi::bw_rigid_body_apply_central_impulse(self.ptr, impulse.x, impulse.y, impulse.z) }
     }
 
     /// 获取位置
