@@ -174,6 +174,14 @@ pub struct MmdModel {
     // VPD 骨骼姿势覆盖（骨骼索引 -> (位移, 旋转)）
     vpd_bone_overrides: HashMap<usize, (Vec3, Quat)>,
 
+    // 每帧外部姿态的加算旋转。调用方在下一次 tick 前整体替换，
+    // 由动画评估后应用，避免把上一帧的旋转重复乘到当前帧。
+    additive_bone_rotations: HashMap<usize, Quat>,
+
+    // 每帧外部姿态的完整 QPS 加算（平移、旋转、缩放）。
+    additive_bone_transforms: HashMap<usize, (Vec3, Quat, Vec3)>,
+    additive_grant_exclusions: HashSet<usize>,
+
     // ======== 第一人称模式 ========
     /// 第一人称模式是否启用
     first_person_enabled: bool,
@@ -289,6 +297,9 @@ impl MmdModel {
             effective_weights_buf: Vec::new(),
             material_morph_results_flat_cache: Vec::new(),
             vpd_bone_overrides: HashMap::new(),
+            additive_bone_rotations: HashMap::new(),
+            additive_bone_transforms: HashMap::new(),
+            additive_grant_exclusions: HashSet::new(),
             vr_hand_mode: 0,
             hand_submesh_flags: Vec::new(),
             hand_detection_initialized: false,
@@ -2138,6 +2149,50 @@ impl MmdModel {
         }
     }
 
+    /// 替换下一帧要应用的外部加算旋转。
+    pub fn replace_additive_bone_rotations(&mut self, rotations: HashMap<usize, Quat>) {
+        self.additive_bone_rotations = rotations;
+    }
+
+    /// 清除外部加算旋转。
+    pub fn clear_additive_bone_rotations(&mut self) {
+        self.additive_bone_rotations.clear();
+    }
+
+    fn apply_additive_bone_rotations(&mut self) {
+        for (&bone_index, &rotation) in &self.additive_bone_rotations {
+            self.bone_manager.add_bone_rotation(bone_index, rotation);
+        }
+    }
+
+    /// 替换下一帧要应用的外部完整 QPS 加算。
+    pub fn replace_additive_bone_transforms(
+        &mut self,
+        transforms: HashMap<usize, (Vec3, Quat, Vec3)>,
+    ) {
+        self.additive_bone_transforms = transforms;
+    }
+
+    pub fn clear_additive_bone_transforms(&mut self) {
+        self.additive_bone_transforms.clear();
+        self.additive_grant_exclusions.clear();
+    }
+
+    pub fn replace_additive_grant_exclusions(&mut self, indices: HashSet<usize>) {
+        self.additive_grant_exclusions = indices;
+    }
+
+    fn apply_additive_bone_transforms(&mut self) {
+        for (&bone_index, &(translation, rotation, scale)) in &self.additive_bone_transforms {
+            if self.additive_grant_exclusions.contains(&bone_index) {
+                self.bone_manager.suppress_append_rotation(bone_index);
+            }
+            self.bone_manager.add_bone_translation(bone_index, translation);
+            self.bone_manager.add_bone_rotation(bone_index, rotation);
+            self.bone_manager.add_bone_scale(bone_index, scale);
+        }
+    }
+
     /// 仅更新动画（不执行 CPU 蒙皮，用于 GPU 蒙皮模式）
     #[allow(unreachable_code)]
     pub fn tick_animation_no_skinning(&mut self, elapsed: f32) {
@@ -2226,6 +2281,8 @@ impl MmdModel {
             .evaluate_normalized(&mut self.bone_manager, &mut self.morph_manager);
 
         self.apply_vpd_bone_overrides();
+        self.apply_additive_bone_rotations();
+        self.apply_additive_bone_transforms();
         self.update_auto_blink(elapsed);
 
         if !self.vr_enabled {
@@ -2784,6 +2841,8 @@ impl MmdModel {
         // VPD 骨骼覆盖
         total += (self.vpd_bone_overrides.capacity()
             * (size_of::<usize>() + size_of::<(Vec3, Quat)>())) as u64;
+        total += (self.additive_bone_transforms.capacity()
+            * (size_of::<usize>() + size_of::<(Vec3, Quat, Vec3)>())) as u64;
 
         total
     }

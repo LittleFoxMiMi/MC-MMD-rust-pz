@@ -302,6 +302,14 @@ public class NativeFunc {
 
     public native String GetBoneNames(long model);
 
+    public native String GetBoneMetadata(long model);
+
+    public native int SetBoneAdditiveTransformBatch(long model, int[] boneIndices, float[] transforms);
+
+    public native void ClearBoneAdditiveTransforms(long model);
+
+    public native void SetBoneAdditiveGrantExclusions(long model, int[] boneIndices);
+
     public native int CopyBonePositionsToBuffer(long model, java.nio.ByteBuffer buffer);
 
     public native int CopyRealtimeUVsToBuffer(long model, java.nio.ByteBuffer buffer);

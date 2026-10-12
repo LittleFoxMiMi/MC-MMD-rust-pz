@@ -1,6 +1,6 @@
 //! JNI 原生函数实现
 
-use jni::objects::{JByteBuffer, JClass, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JIntArray, JString};
 use jni::sys::{jboolean, jbyte, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::ptr;
@@ -16,7 +16,23 @@ use super::{
     TEXTURE_PATH_INDEX,
 };
 
-const VERSION: &str = "v1.0.5";
+const VERSION: &str = "v1.0.6";
+const ADDITIVE_ROTATION_STRIDE: usize = 4;
+const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
+
+fn make_additive_rotation(qx: f32, qy: f32, qz: f32, qw: f32) -> Option<glam::Quat> {
+    // Java supplies the MMD/Blender (left-handed) quaternion.  PMX data is
+    // converted to the engine's right-handed frame by reflecting Z.  A
+    // quaternion under that reflection is (x, y, -z, -w), exactly as used by
+    // the native VMD/VPD loaders below.  Applying the raw quaternion here
+    // makes the probe look numerically correct while rendering the pose with
+    // the wrong handedness.
+    let rotation = glam::Quat::from_xyzw(qx, qy, -qz, -qw);
+    if !rotation.is_finite() || rotation.length_squared() <= 1.0e-8 {
+        return None;
+    }
+    Some(rotation.normalize())
+}
 
 /// 获取版本号
 #[no_mangle]
@@ -3097,6 +3113,39 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetEyeBonePosition(
     }
 }
 
+/// 获取左右眼骨骼尾部的中点。尾部优先使用 PMX 骨骼的第一个子骨骼，
+/// 没有子骨骼时沿眼骨骼到模型中心的方向给出一个短的稳定回退。
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetEyeBoneTailMidpoint(
+    mut env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    out: jni::objects::JFloatArray,
+) {
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else { return; };
+    let mut model = model_arc.lock().unwrap();
+    let names = [
+        ["目.L", "左目", "Eye_L", "eye.L", "目L"],
+        ["目.R", "右目", "Eye_R", "eye.R", "目R"],
+    ];
+    let mut points = Vec::with_capacity(2);
+    for aliases in names {
+        let Some(index) = aliases.iter().find_map(|name| model.bone_manager.find_bone_by_name(name)) else { continue; };
+        let Some(bone) = model.bone_manager.get_bone(index) else { continue; };
+        let start = bone.position();
+        let tail = model.bone_manager.children_of(index).first()
+            .and_then(|child| model.bone_manager.get_bone(*child))
+            .map(|child| child.position())
+            .unwrap_or_else(|| start + glam::Vec3::new(0.0, 0.0, -0.05));
+        points.push((start + tail) * 0.5);
+    }
+    if points.is_empty() { return; }
+    let sum = points.iter().copied().fold(glam::Vec3::ZERO, |a, b| a + b) / points.len() as f32;
+    let buf = [sum.x, sum.y, sum.z];
+    let _ = env.set_float_array_region(&out, 0, &buf);
+}
+
 // ============================================================================
 // 批量子网格元数据（G3 优化）
 // ============================================================================
@@ -3158,6 +3207,197 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetBoneNames(
     env.new_string("[]")
         .map(|s| s.into_raw())
         .unwrap_or(ptr::null_mut())
+}
+
+/// 获取 PMX 静态骨骼元数据（JSON 数组格式）。
+/// 这些数据只用于建立 PZ -> PMX 映射，不包含每帧姿态。
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetBoneMetadata(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+) -> jstring {
+    fn escape(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    }
+
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        let model = model_arc.lock().unwrap();
+        let mut entries = Vec::with_capacity(model.bone_manager.bone_count());
+        for index in 0..model.bone_manager.bone_count() {
+            if let Some(bone) = model.bone_manager.get_bone(index) {
+                let p = bone.initial_position;
+                let s = bone.body_shift;
+                entries.push(format!(
+                    "{{\"index\":{},\"name\":\"{}\",\"parent\":{},\"initial_position\":[{},{},{}],\"body_shift\":[{},{},{}]}}",
+                    index,
+                    escape(&bone.name),
+                    bone.parent_index,
+                    p.x, p.y, p.z,
+                    s.x, s.y, s.z,
+                ));
+            }
+        }
+        if let Ok(value) = env.new_string(format!("[{}]", entries.join(","))) {
+            return value.into_raw();
+        }
+    }
+    env.new_string("[]")
+        .map(|value| value.into_raw())
+        .unwrap_or(ptr::null_mut())
+}
+
+/// 替换每帧外部骨骼加算旋转。quaternions 的布局为 [qx, qy, qz, qw]。
+/// 空数组会清除上一帧的加算姿态，避免旋转跨帧累积。
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetBoneAdditiveRotationBatch(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    bone_indices: JIntArray,
+    quaternions: JFloatArray,
+) -> jint {
+    let index_len = env.get_array_length(&bone_indices).unwrap_or(0).max(0) as usize;
+    let quaternion_len = env.get_array_length(&quaternions).unwrap_or(0).max(0) as usize;
+    let count = index_len.min(quaternion_len / ADDITIVE_ROTATION_STRIDE);
+
+    let mut indices = vec![0i32; count];
+    let mut values = vec![0.0f32; count * ADDITIVE_ROTATION_STRIDE];
+    if count > 0 {
+        if env.get_int_array_region(&bone_indices, 0, &mut indices).is_err()
+            || env.get_float_array_region(&quaternions, 0, &mut values).is_err()
+        {
+            return 0;
+        }
+    }
+
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else {
+        return -1;
+    };
+    let mut model = model_arc.lock().unwrap();
+    let bone_count = model.bone_manager.bone_count();
+    let mut rotations = std::collections::HashMap::with_capacity(count);
+    for (index, &bone_index) in indices.iter().enumerate() {
+        if bone_index < 0 || bone_index as usize >= bone_count {
+            continue;
+        }
+        let offset = index * ADDITIVE_ROTATION_STRIDE;
+        let Some(rotation) = make_additive_rotation(
+            values[offset],
+            values[offset + 1],
+            values[offset + 2],
+            values[offset + 3],
+        ) else {
+            continue;
+        };
+        rotations.insert(bone_index as usize, rotation);
+    }
+    let applied = rotations.len() as jint;
+    model.replace_additive_bone_rotations(rotations);
+    applied
+}
+
+/// 清除每帧外部骨骼加算旋转。
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ClearBoneAdditiveRotations(
+    _env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+) {
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        let mut model = model_arc.lock().unwrap();
+        model.clear_additive_bone_rotations();
+    }
+}
+
+/// 替换每帧外部骨骼完整 QPS 加算。
+/// transforms 的布局为 [tx,ty,tz,qx,qy,qz,qw,sx,sy,sz]。
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetBoneAdditiveTransformBatch(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    bone_indices: JIntArray,
+    transforms: JFloatArray,
+) -> jint {
+    let index_len = env.get_array_length(&bone_indices).unwrap_or(0).max(0) as usize;
+    let transform_len = env.get_array_length(&transforms).unwrap_or(0).max(0) as usize;
+    let count = index_len.min(transform_len / ADDITIVE_TRANSFORM_STRIDE);
+    let mut indices = vec![0i32; count];
+    let mut values = vec![0.0f32; count * ADDITIVE_TRANSFORM_STRIDE];
+    if count > 0 {
+        if env.get_int_array_region(&bone_indices, 0, &mut indices).is_err()
+            || env.get_float_array_region(&transforms, 0, &mut values).is_err()
+        {
+            return 0;
+        }
+    }
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else { return -1; };
+    let mut model = model_arc.lock().unwrap();
+    let bone_count = model.bone_manager.bone_count();
+    let mut result = std::collections::HashMap::with_capacity(count);
+    for (i, &bone_index) in indices.iter().enumerate() {
+        if bone_index < 0 || bone_index as usize >= bone_count { continue; }
+        let off = i * ADDITIVE_TRANSFORM_STRIDE;
+        // Keep this complete-transform path consistent with VMD/VPD and the
+        // rotational JNI path: Java values are MMD/Blender coordinates,
+        // whereas BoneLink operates in the native Z-reflected frame.
+        let rotation = glam::Quat::from_xyzw(
+            values[off + 3], values[off + 4], -values[off + 5], -values[off + 6]);
+        let translation = glam::Vec3::new(
+            values[off], values[off + 1], -values[off + 2]);
+        let scale = glam::Vec3::new(values[off + 7], values[off + 8], values[off + 9]);
+        if !rotation.is_finite() || rotation.length_squared() <= 1.0e-8
+            || !scale.is_finite() || scale.min_element() <= 1.0e-6 { continue; }
+        result.insert(
+            bone_index as usize,
+            (translation,
+             rotation.normalize(), scale));
+    }
+    let applied = result.len() as jint;
+    model.replace_additive_bone_transforms(result);
+    applied
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ClearBoneAdditiveTransforms(
+    _env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+) {
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        model_arc.lock().unwrap().clear_additive_bone_transforms();
+    }
+}
+
+/// Replace grant exclusions for externally baked retarget transforms.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetBoneAdditiveGrantExclusions(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    bone_indices: JIntArray,
+) {
+    let count = env.get_array_length(&bone_indices).unwrap_or(0).max(0) as usize;
+    let mut indices = vec![0i32; count];
+    if env.get_int_array_region(&bone_indices, 0, &mut indices).is_err() { return; }
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else { return; };
+    let mut model = model_arc.lock().unwrap();
+    let bone_count = model.bone_manager.bone_count();
+    model.replace_additive_grant_exclusions(indices.into_iter()
+        .filter(|i| *i >= 0 && (*i as usize) < bone_count)
+        .map(|i| i as usize).collect());
 }
 
 /// 复制所有骨骼的实时世界位置到 ByteBuffer

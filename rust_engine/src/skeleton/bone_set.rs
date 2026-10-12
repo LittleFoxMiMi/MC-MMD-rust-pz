@@ -471,6 +471,13 @@ impl BoneSet {
         }
     }
 
+    /// Add an external local translation after the animation layer.
+    pub fn add_bone_translation(&mut self, index: usize, translation: Vec3) {
+        if let Some(bone) = self.links.get_mut(index) {
+            bone.animation_translate += translation;
+        }
+    }
+
     /// 设置骨骼旋转
     pub fn set_bone_rotation(&mut self, index: usize, rotation: Quat) {
         if let Some(bone) = self.links.get_mut(index) {
@@ -482,6 +489,19 @@ impl BoneSet {
     pub fn add_bone_rotation(&mut self, index: usize, rotation: Quat) {
         if let Some(bone) = self.links.get_mut(index) {
             bone.animation_rotate = bone.animation_rotate * rotation;
+        }
+    }
+
+    /// Add an external local scale after the animation layer.
+    pub fn add_bone_scale(&mut self, index: usize, scale: Vec3) {
+        if let Some(bone) = self.links.get_mut(index) {
+            bone.animation_scale *= scale;
+        }
+    }
+
+    pub fn suppress_append_rotation(&mut self, index: usize) {
+        if let Some(bone) = self.links.get_mut(index) {
+            bone.suppress_append_rotation = true;
         }
     }
 

@@ -141,6 +141,9 @@ pub struct BoneLink {
     /// 动画旋转
     pub animation_rotate: Quat,
 
+    /// 动画缩放。PZ 姿态重定向通常为 ONE，但保留 QPS 的完整数据。
+    pub animation_scale: Vec3,
+
     /// IK 旋转
     pub ik_rotate: Quat,
 
@@ -149,6 +152,10 @@ pub struct BoneLink {
 
     /// 附加旋转（计算结果）
     pub append_rotate: Quat,
+
+    /// A retargeted pose may already contain the reference append/IK result.
+    /// Reset each frame; never mutate the PMX's permanent bone flags.
+    pub suppress_append_rotation: bool,
 
     /// 本地变换矩阵 (local_to_parent)
     /// 类似 nphysics 的 local_to_parent
@@ -187,9 +194,11 @@ impl BoneLink {
             parent_rest_rotation: Quat::IDENTITY,
             animation_translate: Vec3::ZERO,
             animation_rotate: Quat::IDENTITY,
+            animation_scale: Vec3::ONE,
             ik_rotate: Quat::IDENTITY,
             append_translate: Vec3::ZERO,
             append_rotate: Quat::IDENTITY,
+            suppress_append_rotation: false,
             local_to_parent: Mat4::IDENTITY,
             local_to_world: Mat4::IDENTITY,
             parent_to_world: Mat4::IDENTITY,
@@ -344,9 +353,11 @@ impl BoneLink {
     pub fn reset_animation(&mut self) {
         self.animation_translate = Vec3::ZERO;
         self.animation_rotate = Quat::IDENTITY;
+        self.animation_scale = Vec3::ONE;
         self.ik_rotate = Quat::IDENTITY;
         self.append_translate = Vec3::ZERO;
         self.append_rotate = Quat::IDENTITY;
+        self.suppress_append_rotation = false;
     }
 
     /// 计算本地变换 (local_to_parent)
@@ -361,11 +372,12 @@ impl BoneLink {
         if self.flags.contains(BoneFlags::IK_ENABLED) {
             rotation = self.ik_rotate * rotation;
         }
-        if self.flags.contains(BoneFlags::APPEND_ROTATE) {
+        if self.is_append_rotate() {
             rotation = rotation * self.append_rotate;
         }
 
-        self.local_to_parent = Mat4::from_rotation_translation(rotation, translate);
+        self.local_to_parent = Mat4::from_scale_rotation_translation(
+            self.animation_scale, rotation, translate);
     }
 
     /// 获取蒙皮矩阵
@@ -442,7 +454,7 @@ impl BoneLink {
 
     #[inline]
     pub fn is_append_rotate(&self) -> bool {
-        self.flags.contains(BoneFlags::APPEND_ROTATE)
+        self.flags.contains(BoneFlags::APPEND_ROTATE) && !self.suppress_append_rotation
     }
 
     #[inline]
