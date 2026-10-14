@@ -1157,6 +1157,22 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetHeadAngle(
     }
 }
 
+/// Separate first-person neck/head pitch, preserving the head-only legacy API.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetNeckHeadAngle(
+    _env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    neck_pitch: jfloat,
+    head_pitch: jfloat,
+    head_yaw: jfloat,
+) {
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        model_arc.lock().unwrap().set_neck_head_angle(neck_pitch, head_pitch, head_yaw);
+    }
+}
+
 /// 设置眼球追踪角度（眼睛看向摄像头）
 /// eye_x: 上下看的角度（弧度，正值向上）
 /// eye_y: 左右看的角度（弧度，正值向左）
@@ -2100,6 +2116,22 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_CopySkinningMatricesT
         return bone_count as jint;
     }
     0
+}
+
+/// Camera pose including view following, before render-only head scaling.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_CopyCameraSkinningMatricesToBuffer(
+    env: JNIEnv, _class: JClass, model: jlong, buffer: JByteBuffer,
+) -> jint {
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else { return 0; };
+    let model = model_arc.lock().unwrap();
+    let matrices = model.camera_skinning_matrices();
+    let Ok(dst) = env.get_direct_buffer_address(&buffer) else { return 0; };
+    let bytes = matrices.len() * 64;
+    if bytes > env.get_direct_buffer_capacity(&buffer).unwrap_or(0) { return 0; }
+    if bytes > 0 { unsafe { ptr::copy_nonoverlapping(matrices.as_ptr() as *const u8, dst, bytes); } }
+    matrices.len() as jint
 }
 
 /// 获取顶点骨骼索引数据指针（ivec4 格式，用于 GPU 蒙皮）
@@ -3057,6 +3089,17 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetFirstPersonMode(
     }
 }
 
+/// PZ first-person render policy, independent of material masks and camera override.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetFirstPersonPresentation(
+    _env: JNIEnv, _class: JClass, model: jlong, active: jboolean, hide_head: jboolean,
+) {
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        model_arc.lock().unwrap().set_first_person_presentation(active != 0, hide_head != 0);
+    }
+}
+
 /// 获取第一人称模式是否启用
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_IsFirstPersonMode(
@@ -3124,24 +3167,8 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetEyeBoneTailMidpoin
 ) {
     let models = MODELS.read().unwrap();
     let Some(model_arc) = models.get(&model) else { return; };
-    let mut model = model_arc.lock().unwrap();
-    let names = [
-        ["目.L", "左目", "Eye_L", "eye.L", "目L"],
-        ["目.R", "右目", "Eye_R", "eye.R", "目R"],
-    ];
-    let mut points = Vec::with_capacity(2);
-    for aliases in names {
-        let Some(index) = aliases.iter().find_map(|name| model.bone_manager.find_bone_by_name(name)) else { continue; };
-        let Some(bone) = model.bone_manager.get_bone(index) else { continue; };
-        let start = bone.position();
-        let tail = model.bone_manager.children_of(index).first()
-            .and_then(|child| model.bone_manager.get_bone(*child))
-            .map(|child| child.position())
-            .unwrap_or_else(|| start + glam::Vec3::new(0.0, 0.0, -0.05));
-        points.push((start + tail) * 0.5);
-    }
-    if points.is_empty() { return; }
-    let sum = points.iter().copied().fold(glam::Vec3::ZERO, |a, b| a + b) / points.len() as f32;
+    let model = model_arc.lock().unwrap();
+    let sum = model.camera_eye_tail_midpoint();
     let buf = [sum.x, sum.y, sum.z];
     let _ = env.set_float_array_region(&out, 0, &buf);
 }

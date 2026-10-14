@@ -92,6 +92,8 @@ pub struct MmdModel {
     head_angle_x: f32,
     head_angle_y: f32,
     head_angle_z: f32,
+    neck_angle_x: f32,
+    look_neck_bone_cached: Option<usize>,
     head_bone_cached: Option<usize>, // 缓存头部骨骼索引（避免每帧查找）
     head_bone_searched: bool,        // 是否已搜索过头部骨骼
 
@@ -185,6 +187,11 @@ pub struct MmdModel {
     // ======== 第一人称模式 ========
     /// 第一人称模式是否启用
     first_person_enabled: bool,
+    // PZ render-only policy. Never shrink the physics skeleton or camera anchor.
+    pz_first_person_active: bool,
+    pz_hide_head: bool,
+    pz_original_skinning: Vec<Mat4>,
+    pz_camera_skinning: Vec<Mat4>,
     /// 头部骨骼索引缓存（模型加载后计算一次）
     head_bone_index: Option<usize>,
     /// 每个子网格是否属于头部（基于顶点位置自动检测）
@@ -256,6 +263,8 @@ impl MmdModel {
             head_angle_x: 0.0,
             head_angle_y: 0.0,
             head_angle_z: 0.0,
+            neck_angle_x: 0.0,
+            look_neck_bone_cached: None,
             head_bone_cached: None,
             head_bone_searched: false,
             eye_angle_x: 0.0,
@@ -314,6 +323,10 @@ impl MmdModel {
             transition_duration: 0.0,
             is_transitioning: false,
             first_person_enabled: false,
+            pz_first_person_active: false,
+            pz_hide_head: false,
+            pz_original_skinning: Vec::new(),
+            pz_camera_skinning: Vec::new(),
             head_bone_index: None,
             head_submesh_flags: Vec::new(),
             head_detection_initialized: false,
@@ -796,6 +809,111 @@ impl MmdModel {
         self.first_person_enabled
     }
 
+    pub fn set_first_person_presentation(&mut self, active: bool, hide_head: bool) {
+        // The PZ path no longer relies on material classification.
+        self.set_first_person_mode(false);
+        if self.pz_first_person_active == active && self.pz_hide_head == hide_head { return; }
+        self.restore_first_person_skinning();
+        self.pz_first_person_active = active;
+        self.pz_hide_head = hide_head;
+        self.apply_first_person_presentation();
+        // CPU vertices are refreshed by the next normal animation tick. Calling
+        // update() here would skin its already-skinned input a second time.
+    }
+
+    fn restore_first_person_skinning(&mut self) {
+        for (index, matrix) in self.pz_original_skinning.drain(..).enumerate() {
+            self.bone_manager.set_skinning_matrix(index, matrix);
+        }
+        self.pz_camera_skinning.clear();
+    }
+
+    pub fn camera_skinning_matrices(&self) -> &[Mat4] {
+        if self.pz_camera_skinning.is_empty() {
+            self.bone_manager.get_skinning_matrices()
+        } else {
+            &self.pz_camera_skinning
+        }
+    }
+
+    /// Eye-tail anchor from the view-following pose before render-only head scaling.
+    pub fn camera_eye_tail_midpoint(&self) -> Vec3 {
+        let matrices = self.camera_skinning_matrices();
+        let point = |index: usize| -> Option<Vec3> {
+            let bone = self.bone_manager.get_bone(index)?;
+            Some(matrices.get(index)?.transform_point3(bone.initial_position))
+        };
+        let mut sum = Vec3::ZERO;
+        let mut count = 0;
+        for aliases in [["目.L", "左目", "Eye_L", "eye.L", "目L"],
+                ["目.R", "右目", "Eye_R", "eye.R", "目R"]] {
+            let Some(index) = aliases.iter().find_map(|n| self.bone_manager.find_bone_by_name(n)) else { continue; };
+            let Some(start) = point(index) else { continue; };
+            let tail = self.bone_manager.children_of(index).first().and_then(|child| point(*child))
+                .unwrap_or(start + Vec3::new(0.0, 0.0, -0.05));
+            sum += (start + tail) * 0.5;
+            count += 1;
+        }
+        if count > 0 { sum / count as f32 }
+        else { self.head_bone_cached.and_then(point).unwrap_or(Vec3::ZERO) }
+    }
+
+    // Final overlay: animation pitch filtering, view following, camera capture, neck collapse.
+    // Physics/global bone transforms and all non-descendant bones remain untouched.
+    fn apply_first_person_presentation(&mut self) {
+        if !self.pz_first_person_active { return; }
+        self.init_look_bones();
+        let Some(head) = self.head_bone_cached else { return; };
+        self.pz_original_skinning.extend_from_slice(self.bone_manager.get_skinning_matrices());
+        let roots: Vec<usize> = self.look_neck_bone_cached.into_iter().chain(Some(head)).collect();
+        for root in roots {
+            let bone = self.bone_manager.get_bone(root).unwrap();
+            let global = self.bone_manager.get_skinning_matrices()[root]
+                * Mat4::from_translation(bone.initial_position);
+            let parent = if bone.parent_index >= 0 {
+                let p = bone.parent_index as usize;
+                let rest = self.bone_manager.get_bone(p).unwrap().initial_position;
+                self.bone_manager.get_skinning_matrices()[p] * Mat4::from_translation(rest)
+            } else { Mat4::IDENTITY };
+            let (scale, rotation, translation) = (parent.inverse() * global).to_scale_rotation_translation();
+            // YXZ keeps heading and roll while removing the local look-up/down component.
+            let (yaw, _, roll) = rotation.normalize().to_euler(glam::EulerRot::YXZ);
+            let corrected = parent * Mat4::from_scale_rotation_translation(scale,
+                Quat::from_euler(glam::EulerRot::YXZ, yaw, 0.0, roll), translation);
+            self.transform_skinning_subtree(root, corrected * global.inverse());
+        }
+        // Keep camera and face together when optional view following is enabled.
+        // Animation pitch stays removed; mouse pitch is shared between neck/head.
+        let head_pitch = if let Some(neck) = self.look_neck_bone_cached {
+            self.rotate_skinning_subtree(neck, Quat::from_rotation_x(self.neck_angle_x));
+            self.head_angle_x
+        } else { self.head_angle_x + self.neck_angle_x };
+        self.rotate_skinning_subtree(head, Quat::from_euler(glam::EulerRot::XYZ,
+            head_pitch, self.head_angle_y, self.head_angle_z));
+        self.pz_camera_skinning.extend_from_slice(self.bone_manager.get_skinning_matrices());
+        if self.pz_hide_head {
+            let root = self.look_neck_bone_cached.unwrap_or(head);
+            let rest = self.bone_manager.get_bone(root).unwrap().initial_position;
+            let pivot = self.bone_manager.get_skinning_matrices()[root].transform_point3(rest);
+            let collapse = Mat4::from_translation(pivot) * Mat4::from_scale(Vec3::splat(0.0001))
+                * Mat4::from_translation(-pivot);
+            self.transform_skinning_subtree(root, collapse);
+        }
+    }
+
+    fn transform_skinning_subtree(&mut self, root: usize, delta: Mat4) {
+        for index in self.bone_manager.collect_descendants(root) {
+            let matrix = self.bone_manager.get_skinning_matrices()[index];
+            self.bone_manager.set_skinning_matrix(index, delta * matrix);
+        }
+    }
+
+    fn rotate_skinning_subtree(&mut self, root: usize, rotation: Quat) {
+        let rest = self.bone_manager.get_bone(root).unwrap().initial_position;
+        let global = self.bone_manager.get_skinning_matrices()[root] * Mat4::from_translation(rest);
+        self.transform_skinning_subtree(root, global * Mat4::from_quat(rotation) * global.inverse());
+    }
+
     /// 获取头部骨骼的初始 Y 坐标（静态休息姿势，用于相机高度）
     /// 返回值为模型局部空间的 Y 坐标
     pub fn get_head_bone_rest_position_y(&mut self) -> f32 {
@@ -876,6 +994,7 @@ impl MmdModel {
 
     /// 开始动画帧
     pub fn begin_animation(&mut self) {
+        self.restore_first_person_skinning();
         self.bone_manager.begin_update();
     }
 
@@ -1006,6 +1125,7 @@ impl MmdModel {
         self.update_node_animation(true);
 
         self.end_animation();
+        self.apply_first_person_presentation();
         self.update();
     }
 
@@ -1092,7 +1212,9 @@ impl MmdModel {
         transition_time: f32,
     ) {
         if transition_time > 0.0 {
-            self.transition_matrices = self.bone_manager.get_skinning_matrices().to_vec();
+            self.transition_matrices = if self.pz_original_skinning.is_empty() {
+                self.bone_manager.get_skinning_matrices().to_vec()
+            } else { self.pz_original_skinning.clone() };
             self.transition_duration = transition_time;
             self.transition_progress = 0.0;
             self.is_transitioning = true;
@@ -1299,13 +1421,30 @@ impl MmdModel {
 
     /// 设置头部角度
     pub fn set_head_angle(&mut self, x: f32, y: f32, z: f32) {
-        self.head_angle_x = x;
-        self.head_angle_y = y;
-        self.head_angle_z = z;
+        self.set_look_angles(0.0, x, y, z);
     }
 
-    /// 应用头部旋转到骨骼
-    fn apply_head_rotation(&mut self) {
+    /// Independent first-person neck/head pitch; existing head-only API resets it.
+    pub fn set_neck_head_angle(&mut self, neck_pitch: f32, head_pitch: f32, head_yaw: f32) {
+        self.set_look_angles(neck_pitch, head_pitch, head_yaw, 0.0);
+    }
+
+    fn set_look_angles(&mut self, neck: f32, pitch: f32, yaw: f32, roll: f32) {
+        let changed = self.neck_angle_x != neck || self.head_angle_x != pitch
+            || self.head_angle_y != yaw || self.head_angle_z != roll;
+        self.neck_angle_x = neck;
+        self.head_angle_x = pitch;
+        self.head_angle_y = yaw;
+        self.head_angle_z = roll;
+        if changed && self.pz_first_person_active {
+            // Camera is queried immediately on the game thread, before the next
+            // normal animation tick. Refresh both poses without ticking physics.
+            self.restore_first_person_skinning();
+            self.apply_first_person_presentation();
+        }
+    }
+
+    fn init_look_bones(&mut self) {
         // 延迟搜索 + 缓存头部骨骼索引（只搜索一次）
         if !self.head_bone_searched {
             self.head_bone_searched = true;
@@ -1316,12 +1455,46 @@ impl MmdModel {
                     break;
                 }
             }
+            // Only use a neck that actually parents the head (helpers allowed).
+            // A missing/unrelated neck falls back to the full pitch on the head.
+            let neck = ["首", "neck", "Neck"].iter()
+                .find_map(|name| self.bone_manager.find_bone_by_name(name));
+            let mut parent = self.head_bone_cached
+                .and_then(|index| self.bone_manager.get_bone(index))
+                .map(|bone| bone.parent_index).unwrap_or(-1);
+            for _ in 0..self.bone_manager.bone_count() {
+                if parent < 0 { break; }
+                let index = parent as usize;
+                if Some(index) == neck {
+                    self.look_neck_bone_cached = neck;
+                    break;
+                }
+                parent = self.bone_manager.get_bone(index)
+                    .map(|bone| bone.parent_index).unwrap_or(-1);
+            }
         }
 
+    }
+
+    /// 应用头部旋转到骨骼
+    fn apply_head_rotation(&mut self) {
+        self.init_look_bones();
+        if self.pz_first_person_active {
+            // PZ view pitch/yaw is applied by the final render/camera overlay.
+            self.apply_eye_rotation();
+            return;
+        }
         if let Some(bone_idx) = self.head_bone_cached {
+            let head_pitch = if let Some(neck_idx) = self.look_neck_bone_cached {
+                self.bone_manager.add_bone_rotation(neck_idx,
+                    Quat::from_rotation_x(self.neck_angle_x));
+                self.head_angle_x
+            } else {
+                self.head_angle_x + self.neck_angle_x
+            };
             let rotation = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
-                self.head_angle_x,
+                head_pitch,
                 self.head_angle_y,
                 self.head_angle_z,
             );
@@ -2340,6 +2513,7 @@ impl MmdModel {
 
         self.apply_transition_blend(elapsed);
 
+        self.apply_first_person_presentation();
         if cpu_skinning {
             self.update();
         } else if !self.debug_logged && physics_enabled {
@@ -2821,6 +2995,7 @@ impl MmdModel {
         // 物理缓冲区
         total += (self.physics_bone_transforms_buf.capacity() * size_of::<Mat4>()) as u64;
         total += (self.transition_matrices.capacity() * size_of::<Mat4>()) as u64;
+        total += ((self.pz_original_skinning.capacity() + self.pz_camera_skinning.capacity()) * size_of::<Mat4>()) as u64;
 
         // 材质可见性
         total += (self.material_visible.capacity() * size_of::<bool>()) as u64;
@@ -2887,6 +3062,158 @@ mod tests {
     use crate::skeleton::BoneLink;
     use crate::vr::{VrTrackedPose, XR_TO_MODEL_SCALE};
     use crate::vrm_runtime::{ArmIkHandCalibration, BodyTrackingCalibration};
+
+    fn make_neck_head_test_model(neck_name: &str, head_parent: i32) -> MmdModel {
+        let mut model = MmdModel::new();
+        let mut neck = BoneLink::new(neck_name.to_string());
+        neck.initial_position = Vec3::new(0.0, 1.5, 0.0);
+        model.bone_manager.add_bone(neck);
+        let mut head = BoneLink::new("Head".to_string());
+        head.initial_position = Vec3::new(0.0, 1.7, 0.0);
+        head.parent_index = head_parent;
+        model.bone_manager.add_bone(head);
+        model.bone_manager.build_hierarchy();
+        model
+    }
+
+    #[test]
+    fn first_person_presentation_keeps_camera_physics_and_restores_render_pose() {
+        let mut model = make_neck_head_test_model("Neck", 0);
+        let mut eye = BoneLink::new("Eye_L".to_string());
+        eye.parent_index = 1;
+        eye.initial_position = Vec3::new(-0.05, 1.75, 0.1);
+        model.bone_manager.add_bone(eye);
+        let mut arm = BoneLink::new("Arm".to_string());
+        arm.initial_position = Vec3::new(0.3, 1.4, 0.0);
+        model.bone_manager.add_bone(arm);
+        model.bone_manager.build_hierarchy();
+        model.begin_animation();
+        model.bone_manager.set_bone_rotation(0, Quat::from_euler(glam::EulerRot::YXZ, 0.2, -0.6, 0.1));
+        model.bone_manager.set_bone_rotation(1, Quat::from_euler(glam::EulerRot::YXZ, -0.1, 0.4, -0.05));
+        model.update_node_animation(false);
+        model.update_node_animation(true);
+        let original = model.bone_manager.get_skinning_matrices().to_vec();
+        let physics_head = model.bone_manager.get_global_transform(1);
+        model.set_first_person_presentation(true, false);
+        let eye_position = model.camera_eye_tail_midpoint();
+        let visible = model.bone_manager.get_skinning_matrices().to_vec();
+        for root in [0, 1] {
+            let global = visible[root] * Mat4::from_translation(model.bone_manager.get_bone(root).unwrap().initial_position);
+            let local = if root == 1 {
+                (visible[0] * Mat4::from_translation(Vec3::new(0.0, 1.5, 0.0))).inverse() * global
+            } else { global };
+            let (_, rotation, _) = local.to_scale_rotation_translation();
+            assert!(rotation.to_euler(glam::EulerRot::YXZ).1.abs() < 1e-6);
+        }
+        assert!(model.bone_manager.get_global_transform(1).abs_diff_eq(physics_head, 1e-6));
+        model.set_head_angle(1.0, 0.5, 0.3); // Explicit view pitch remains after animation filtering.
+        let following_eye = model.camera_eye_tail_midpoint();
+        assert!(following_eye.distance(eye_position) > 0.01);
+        model.set_first_person_presentation(true, true);
+        assert!(model.camera_eye_tail_midpoint().abs_diff_eq(following_eye, 1e-6));
+        assert!(model.bone_manager.get_skinning_matrices()[3].abs_diff_eq(original[3], 1e-6));
+        let neck_matrix = model.bone_manager.get_skinning_matrices()[0];
+        let pivot = visible[0].transform_point3(Vec3::new(0.0, 1.5, 0.0));
+        let delta = Mat4::from_translation(pivot) * Mat4::from_scale(Vec3::splat(0.0001)) * Mat4::from_translation(-pivot);
+        assert!(neck_matrix.abs_diff_eq(delta * visible[0], 1e-6));
+        let (vertex, normal) = compute_vertex_skinning(Vec3::new(0.1, 1.8, 0.1), Vec3::Y,
+            &VertexWeight::Bdef1 { bone: 1 }, model.bone_manager.get_skinning_matrices());
+        assert!(vertex.distance(pivot) < 0.0001 && normal.is_finite());
+        model.set_first_person_presentation(false, false);
+        for (actual, expected) in model.bone_manager.get_skinning_matrices().iter().zip(original) {
+            assert!(actual.abs_diff_eq(expected, 1e-6));
+        }
+    }
+
+    #[test]
+    fn first_person_presentation_preserves_view_pitch_after_removing_animation_pitch() {
+        for (neck_name, parent) in [("Neck", 0), ("Root", 0), ("Neck", -1)] {
+            let mut model = make_neck_head_test_model(neck_name, parent);
+            model.begin_animation();
+            model.bone_manager.set_bone_rotation(0, Quat::from_rotation_x(-0.6));
+            model.bone_manager.set_bone_rotation(1, Quat::from_rotation_x(0.4));
+            model.update_node_animation(false);
+            model.update_node_animation(true);
+            model.set_first_person_presentation(true, false);
+            let filtered = model.bone_manager.get_skinning_matrices().to_vec();
+            model.set_first_person_presentation(false, false);
+            model.set_neck_head_angle(25_f32.to_radians(), 25_f32.to_radians(), 0.2);
+            model.set_first_person_presentation(true, false);
+            let (neck_angle, head_angle) = if neck_name == "Neck" && parent == 0 {
+                (25_f32.to_radians(), 25_f32.to_radians())
+            } else { (0.0, 50_f32.to_radians()) };
+            let neck_global = filtered[0] * Mat4::from_translation(Vec3::new(0.0, 1.5, 0.0));
+            let delta = neck_global * Mat4::from_rotation_x(neck_angle) * neck_global.inverse();
+            let head_global = delta * filtered[1] * Mat4::from_translation(Vec3::new(0.0, 1.7, 0.0));
+            let head_delta = head_global * Mat4::from_quat(Quat::from_euler(glam::EulerRot::XYZ,
+                head_angle, 0.2, 0.0)) * head_global.inverse();
+            assert!(model.bone_manager.get_skinning_matrices()[0].abs_diff_eq(delta * filtered[0], 1e-6));
+            assert!(model.bone_manager.get_skinning_matrices()[1].abs_diff_eq(head_delta * delta * filtered[1], 1e-6));
+            assert!(model.camera_skinning_matrices()[1].abs_diff_eq(head_delta * delta * filtered[1], 1e-6));
+        }
+    }
+
+    #[test]
+    fn first_person_presentation_falls_back_to_head_and_never_accumulates_scale() {
+        for (name, parent) in [("Root", 0), ("Neck", -1)] {
+            let mut model = make_neck_head_test_model(name, parent);
+            model.set_first_person_presentation(true, true);
+            for _ in 0..4 {
+                model.tick_animation_no_skinning(0.0);
+                let m = model.bone_manager.get_skinning_matrices();
+                assert!((m[1].x_axis.truncate().length() - 0.0001).abs() < 1e-8);
+                assert!(m[0].abs_diff_eq(Mat4::IDENTITY, 1e-6));
+                assert!(model.camera_skinning_matrices()[1].abs_diff_eq(Mat4::IDENTITY, 1e-6));
+            }
+            model.transition_layer_to(0, None, 0.2);
+            assert!(model.transition_matrices[1].abs_diff_eq(Mat4::IDENTITY, 1e-6));
+            model.tick_animation_no_skinning(0.1);
+            assert!((model.bone_manager.get_skinning_matrices()[1].x_axis.truncate().length() - 0.0001).abs() < 1e-8);
+            model.set_first_person_presentation(false, false);
+            assert!(model.bone_manager.get_skinning_matrices()[1].abs_diff_eq(Mat4::IDENTITY, 1e-6));
+        }
+        let mut model = MmdModel::new();
+        model.set_first_person_presentation(true, true);
+        model.tick_animation_no_skinning(0.0);
+        assert_eq!(model.camera_eye_tail_midpoint(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn neck_head_split_preserves_animation_and_resets_with_head_only_api() {
+        let mut model = make_neck_head_test_model("Neck", 0);
+        let neck_base = Quat::from_rotation_z(0.12);
+        let head_base = Quat::from_rotation_y(-0.15);
+        for _ in 0..3 {
+            model.begin_animation();
+            model.bone_manager.set_bone_rotation(0, neck_base);
+            model.bone_manager.set_bone_rotation(1, head_base);
+            model.set_neck_head_angle(-30_f32.to_radians(), -40_f32.to_radians(), 0.2);
+            model.apply_head_rotation();
+            let neck = model.bone_manager.get_bone(0).unwrap().animation_rotate;
+            let head = model.bone_manager.get_bone(1).unwrap().animation_rotate;
+            assert!(neck.abs_diff_eq(neck_base * Quat::from_rotation_x(-30_f32.to_radians()), 1e-6));
+            assert!(head.abs_diff_eq(head_base * Quat::from_euler(glam::EulerRot::XYZ,
+                -40_f32.to_radians(), 0.2, 0.0), 1e-6));
+        }
+        model.begin_animation();
+        model.set_head_angle(0.0, 0.0, 0.0);
+        model.apply_head_rotation();
+        assert!(model.bone_manager.get_bone(0).unwrap().animation_rotate.abs_diff_eq(Quat::IDENTITY, 1e-6));
+        assert!(model.bone_manager.get_bone(1).unwrap().animation_rotate.abs_diff_eq(Quat::IDENTITY, 1e-6));
+    }
+
+    #[test]
+    fn neck_head_missing_or_unrelated_neck_uses_full_pitch_on_head() {
+        for (name, parent) in [("Root", 0), ("Neck", -1)] {
+            let mut model = make_neck_head_test_model(name, parent);
+            model.begin_animation();
+            model.set_neck_head_angle(30_f32.to_radians(), 40_f32.to_radians(), 0.0);
+            model.apply_head_rotation();
+            assert!(model.bone_manager.get_bone(0).unwrap().animation_rotate.abs_diff_eq(Quat::IDENTITY, 1e-6));
+            assert!(model.bone_manager.get_bone(1).unwrap().animation_rotate
+                .abs_diff_eq(Quat::from_rotation_x(70_f32.to_radians()), 1e-6));
+        }
+    }
 
     #[test]
     fn set_first_person_mode_should_restore_user_material_visibility() {
