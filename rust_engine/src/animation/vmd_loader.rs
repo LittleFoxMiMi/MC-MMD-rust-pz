@@ -579,6 +579,32 @@ impl VmdAnimation {
         }
     }
 
+    /// Sparse additive evaluation: absent model tracks are deliberately ignored.
+    pub fn evaluate_additive(&self, frame: f32, bones: &mut BoneManager, morphs: &mut MorphManager) {
+        let frame = frame.max(0.0);
+        let index = frame.floor() as u32;
+        let amount = frame.fract();
+        for name in self.motion.bone_track_names() {
+            if let Some(i) = bones.find_bone_by_name(name) {
+                let raw = self.motion.find_bone_transform(name, index, amount);
+                let translation = bones.convert_vmd_translation(raw.translation);
+                let rotation = bones.convert_vmd_rotation(raw.orientation);
+                if let Some(bone) = bones.get_bone(i) {
+                    let t = bone.animation_translate + translation;
+                    let q = (bone.animation_rotate * rotation).normalize();
+                    bones.set_bone_translation(i, t);
+                    bones.set_bone_rotation(i, q);
+                }
+            }
+        }
+        for name in self.motion.morph_track_names() {
+            if let Some(i) = morphs.find_morph_by_name(name) {
+                let value = morphs.get_morph_weight(i) + self.motion.find_morph_weight(name, index, amount);
+                morphs.set_morph_weight(i, value.clamp(0.0, 1.0));
+            }
+        }
+    }
+
     /// 检查是否包含骨骼轨道
     pub fn contains_bone_track(&self, name: &str) -> bool {
         self.motion.contains_bone_track(name)

@@ -183,6 +183,8 @@ pub struct MmdModel {
     // 每帧外部姿态的完整 QPS 加算（平移、旋转、缩放）。
     additive_bone_transforms: HashMap<usize, (Vec3, Quat, Vec3)>,
     additive_grant_exclusions: HashSet<usize>,
+    pub pz_vmd_layers: Vec<(Arc<VmdAnimation>, f32, bool)>,
+    pub pz_manual_morphs: Vec<(usize, f32)>,
 
     // ======== 第一人称模式 ========
     /// 第一人称模式是否启用
@@ -309,6 +311,8 @@ impl MmdModel {
             additive_bone_rotations: HashMap::new(),
             additive_bone_transforms: HashMap::new(),
             additive_grant_exclusions: HashSet::new(),
+            pz_vmd_layers: Vec::new(),
+            pz_manual_morphs: Vec::new(),
             vr_hand_mode: 0,
             hand_submesh_flags: Vec::new(),
             hand_detection_initialized: false,
@@ -2465,6 +2469,35 @@ impl MmdModel {
         self.with_vrm_runtime_state(|model, runtime_state| {
             runtime_state.process_expressions(model);
         });
+
+        for &(index, weight) in &self.pz_manual_morphs {
+            self.morph_manager.set_morph_weight(index, weight);
+        }
+        let mut pz_replacement = false;
+        for (animation, frame, additive) in &self.pz_vmd_layers {
+            if *additive {
+                animation.evaluate_additive(*frame, &mut self.bone_manager, &mut self.morph_manager);
+            } else {
+                pz_replacement = true;
+                self.bone_manager.reset_all_transforms();
+                self.bone_manager.reset_all_ik_enabled();
+                self.morph_manager.reset_all_weights();
+                animation.evaluate(*frame, &mut self.bone_manager, &mut self.morph_manager);
+            }
+        }
+        if pz_replacement {
+            // Replacement clears PZ's retargeted root, including its fixed
+            // left quarter-turn. Restore only that facing, in native space,
+            // after all VMD layers so a root track cannot overwrite it.
+            // Rotate root motion too; preserve the PMX root's bind pivot.
+            if let Some(index) = self.bone_manager.find_bone_by_name("全ての親") {
+                if let Some(root) = self.bone_manager.get_bone_mut(index) {
+                    let facing = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+                    root.animation_translate = facing * root.animation_translate;
+                    root.animation_rotate = (facing * root.animation_rotate).normalize();
+                }
+            }
+        }
 
         self.update_morph_animation();
 

@@ -1,6 +1,6 @@
 //! JNI 原生函数实现
 
-use jni::objects::{JByteBuffer, JClass, JFloatArray, JIntArray, JString};
+use jni::objects::{JBooleanArray, JByteBuffer, JClass, JFloatArray, JIntArray, JLongArray, JString};
 use jni::sys::{jboolean, jbyte, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::ptr;
@@ -19,6 +19,44 @@ use super::{
 const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
+
+/// One immutable PZ frame submission; Java UI threads never touch native poses.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAnimationState(
+    env: JNIEnv, _class: JClass, model: jlong, handles: JLongArray,
+    frames: JFloatArray, additive: JBooleanArray, indices: JIntArray, weights: JFloatArray,
+) {
+    let count = env.get_array_length(&handles).unwrap_or(0) as usize;
+    let morph_count = env.get_array_length(&indices).unwrap_or(0) as usize;
+    if count > 64 || morph_count > 100000
+        || env.get_array_length(&frames).unwrap_or(-1) != count as i32
+        || env.get_array_length(&additive).unwrap_or(-1) != count as i32
+        || env.get_array_length(&weights).unwrap_or(-1) != morph_count as i32 { return; }
+    let mut h = vec![0; count]; let mut f = vec![0.0; count]; let mut a = vec![0; count];
+    let mut i = vec![0; morph_count]; let mut w = vec![0.0; morph_count];
+    if env.get_long_array_region(&handles, 0, &mut h).is_err()
+        || env.get_float_array_region(&frames, 0, &mut f).is_err()
+        || env.get_boolean_array_region(&additive, 0, &mut a).is_err()
+        || env.get_int_array_region(&indices, 0, &mut i).is_err()
+        || env.get_float_array_region(&weights, 0, &mut w).is_err() { return; }
+    let layers = {
+        let animations = ANIMATIONS.read().unwrap();
+        h.iter().enumerate().filter_map(|(n, handle)| {
+            if !f[n].is_finite() { return None; }
+            animations.get(handle).map(|animation| (animation.clone(), f[n].max(0.0), a[n] != 0))
+        }).collect()
+    };
+    let models = MODELS.read().unwrap();
+    if let Some(model) = models.get(&model) {
+        let mut model = model.lock().unwrap();
+        model.pz_vmd_layers = layers;
+        let count = model.morph_manager.morph_count();
+        model.pz_manual_morphs = i.iter().zip(w.iter()).filter_map(|(&index, &weight)| {
+            if index < 0 || index as usize >= count || !weight.is_finite() { None }
+            else { Some((index as usize, weight.clamp(0.0, 1.0))) }
+        }).collect();
+    }
+}
 
 fn make_additive_rotation(qx: f32, qy: f32, qz: f32, qw: f32) -> Option<glam::Quat> {
     // Java supplies the MMD/Blender (left-handed) quaternion.  PMX data is
