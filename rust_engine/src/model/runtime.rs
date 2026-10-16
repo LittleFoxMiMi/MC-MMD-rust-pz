@@ -184,6 +184,7 @@ pub struct MmdModel {
     additive_bone_transforms: HashMap<usize, (Vec3, Quat, Vec3)>,
     additive_grant_exclusions: HashSet<usize>,
     pub pz_vmd_layers: Vec<(Arc<VmdAnimation>, f32, bool)>,
+    pub pz_action_turns: Vec<(usize, Vec3, Quat, Vec3)>,
     pub pz_manual_morphs: Vec<(usize, f32)>,
 
     // ======== 第一人称模式 ========
@@ -312,6 +313,7 @@ impl MmdModel {
             additive_bone_transforms: HashMap::new(),
             additive_grant_exclusions: HashSet::new(),
             pz_vmd_layers: Vec::new(),
+            pz_action_turns: Vec::new(),
             pz_manual_morphs: Vec::new(),
             vr_hand_mode: 0,
             hand_submesh_flags: Vec::new(),
@@ -2495,6 +2497,15 @@ impl MmdModel {
                     let facing = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
                     root.animation_translate = facing * root.animation_translate;
                     root.animation_rotate = (facing * root.animation_rotate).normalize();
+                }
+            }
+            // Frame-local native turn deltas are normalized against the PZ
+            // neutral pose by Java. Apply them after the fixed VMD facing.
+            for &(index, translation, rotation, scale) in &self.pz_action_turns {
+                if let Some(bone) = self.bone_manager.get_bone_mut(index) {
+                    bone.animation_translate = translation + rotation * (scale * bone.animation_translate);
+                    bone.animation_rotate = (rotation * bone.animation_rotate).normalize();
+                    bone.animation_scale *= scale;
                 }
             }
         }

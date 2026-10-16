@@ -20,6 +20,28 @@ const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
 
+/// Native-space QPS deltas for the optional original PZ turning overlay.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZActionTurnTransforms(
+    env: JNIEnv, _class: JClass, model: jlong, indices: JIntArray, values: JFloatArray,
+) {
+    let count = env.get_array_length(&indices).unwrap_or(0) as usize;
+    if count > 100000 || env.get_array_length(&values).unwrap_or(-1) != (count * 10) as i32 { return; }
+    let mut i = vec![0; count]; let mut v = vec![0.0; count * 10];
+    if env.get_int_array_region(&indices, 0, &mut i).is_err()
+        || env.get_float_array_region(&values, 0, &mut v).is_err() { return; }
+    let models = MODELS.read().unwrap();
+    if let Some(model) = models.get(&model) {
+        let mut model = model.lock().unwrap();
+        model.pz_action_turns = i.iter().enumerate().filter_map(|(n, &index)| {
+            let p = &v[n * 10..n * 10 + 10];
+            let q = glam::Quat::from_xyzw(p[3], p[4], p[5], p[6]);
+            if index < 0 || p.iter().any(|x| !x.is_finite()) || q.length_squared() < 1e-8 { return None; }
+            Some((index as usize, glam::Vec3::new(p[0], p[1], p[2]), q.normalize(), glam::Vec3::new(p[7], p[8], p[9])))
+        }).collect();
+    }
+}
+
 /// One immutable PZ frame submission; Java UI threads never touch native poses.
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAnimationState(
