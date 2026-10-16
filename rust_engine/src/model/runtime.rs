@@ -184,6 +184,8 @@ pub struct MmdModel {
     additive_bone_transforms: HashMap<usize, (Vec3, Quat, Vec3)>,
     additive_grant_exclusions: HashSet<usize>,
     pub pz_vmd_layers: Vec<(Arc<VmdAnimation>, f32, bool)>,
+    /// PZ drives ordinary FK legs. Replacement VMDs retain their own IK policy.
+    pub pz_suppress_leg_ik: bool,
     pub pz_action_turns: Vec<(usize, Vec3, Quat, Vec3)>,
     pub pz_manual_morphs: Vec<(usize, f32)>,
 
@@ -313,6 +315,7 @@ impl MmdModel {
             additive_bone_transforms: HashMap::new(),
             additive_grant_exclusions: HashSet::new(),
             pz_vmd_layers: Vec::new(),
+            pz_suppress_leg_ik: false,
             pz_action_turns: Vec::new(),
             pz_manual_morphs: Vec::new(),
             vr_hand_mode: 0,
@@ -2448,6 +2451,13 @@ impl MmdModel {
 
     /// 初始化物理系统（Bullet3）
     fn tick_animation_internal(&mut self, elapsed: f32, cpu_skinning: bool) {
+        self.tick_animation_measured(elapsed, cpu_skinning, false);
+    }
+
+    /// Same evaluation order as the normal tick. Clocks are used only by the PZ Debug API.
+    pub fn tick_animation_measured(&mut self, elapsed: f32, cpu_skinning: bool, profile: bool) -> [u64; 3] {
+        let started = profile.then(std::time::Instant::now);
+        let mut physics_ns = 0;
         self.with_vrm_runtime_state(|model, runtime_state| {
             runtime_state.apply_inputs(model);
         });
@@ -2510,6 +2520,14 @@ impl MmdModel {
             }
         }
 
+        // Apply after all VMD layers, before either pre/post-physics IK pass.
+        // Additive clips never own IK state; the last replacement does.
+        if self.pz_suppress_leg_ik && !pz_replacement {
+            for name in ["左足ＩＫ", "右足ＩＫ", "左足IK", "右足IK",
+                "左つま先ＩＫ", "右つま先ＩＫ", "左つま先IK", "右つま先IK"] {
+                self.bone_manager.set_ik_enabled_by_name(name, false);
+            }
+        }
         self.update_morph_animation();
 
         if !cpu_skinning {
@@ -2544,9 +2562,11 @@ impl MmdModel {
 
         let physics_enabled = !self.is_vrm && self.physics_enabled && self.physics.is_some();
         if physics_enabled {
+            let physics_started = profile.then(std::time::Instant::now);
             self.update_physics(elapsed);
             self.update_node_animation(true);
             self.end_physics_update();
+            physics_ns = physics_started.map_or(0, |t| t.elapsed().as_nanos() as u64);
         }
 
         self.end_animation();
@@ -2558,6 +2578,7 @@ impl MmdModel {
         self.apply_transition_blend(elapsed);
 
         self.apply_first_person_presentation();
+        let before_skinning = started.map_or(0, |t| t.elapsed().as_nanos() as u64);
         if cpu_skinning {
             self.update();
         } else if !self.debug_logged && physics_enabled {
@@ -2576,6 +2597,8 @@ impl MmdModel {
             }
             */
         }
+        let total = started.map_or(0, |t| t.elapsed().as_nanos() as u64);
+        [before_skinning.saturating_sub(physics_ns), physics_ns, total.saturating_sub(before_skinning)]
     }
 
     pub fn init_physics(&mut self) -> bool {
@@ -3106,6 +3129,101 @@ mod tests {
     use crate::skeleton::BoneLink;
     use crate::vr::{VrTrackedPose, XR_TO_MODEL_SCALE};
     use crate::vrm_runtime::{ArmIkHandCalibration, BodyTrackingCalibration};
+
+    fn leg_ik_policy_model() -> (MmdModel, Vec<usize>) {
+        use crate::skeleton::{BoneFlags, IkConfig, IkLink};
+        let mut model = MmdModel::new();
+        let mut joints = Vec::new();
+        // Every spelling, both sides, and an unrelated IK. Include post-physics IK.
+        for (n, name) in ["左足ＩＫ", "右足ＩＫ", "左つま先ＩＫ", "右つま先ＩＫ",
+            "左足IK", "右足IK", "左つま先IK", "右つま先IK", "腕IK"].iter().enumerate() {
+            let at = model.bone_manager.bone_count();
+            joints.push(at);
+            let origin = Vec3::new(n as f32 * 4.0, 0.0, 0.0);
+            let mut joint = BoneLink::new(format!("joint{n}"));
+            joint.initial_position = origin;
+            if n % 2 != 0 { joint.flags.insert(BoneFlags::DEFORM_AFTER_PHYSICS); }
+            model.bone_manager.add_bone(joint);
+            let mut end = BoneLink::new(format!("end{n}"));
+            end.parent_index = at as i32;
+            end.initial_position = origin + Vec3::Y;
+            if n % 2 != 0 { end.flags.insert(BoneFlags::DEFORM_AFTER_PHYSICS); }
+            model.bone_manager.add_bone(end);
+            let mut controller = BoneLink::new(name.to_string());
+            controller.initial_position = origin + Vec3::X;
+            controller.flags.insert(BoneFlags::IK);
+            if n % 2 != 0 { controller.flags.insert(BoneFlags::DEFORM_AFTER_PHYSICS); }
+            controller.ik_config = Some(IkConfig { target_bone: (at + 1) as i32,
+                iterations: 20, limit_angle: std::f32::consts::PI,
+                links: vec![IkLink { bone_index: at as i32, has_limits: false,
+                    limit_min: Vec3::ZERO, limit_max: Vec3::ZERO }] });
+            model.bone_manager.add_bone(controller);
+        }
+        model.bone_manager.build_hierarchy();
+        (model, joints)
+    }
+
+    fn ik_switch_animation(name: &str, enabled: bool) -> Arc<VmdAnimation> {
+        // Exercise the real VMD IK reader instead of constructing private keyframes.
+        let mut bytes = vec![0u8; 50];
+        bytes[..25].copy_from_slice(b"Vocaloid Motion Data 0002");
+        for _ in 0..5 { bytes.extend_from_slice(&0u32.to_le_bytes()); }
+        let (encoded, _, _) = encoding_rs::SHIFT_JIS.encode(name);
+        let mut field = [0u8; 20];
+        field[..encoded.len()].copy_from_slice(&encoded);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        for (frame, state) in [(0u32, enabled), (10u32, !enabled), (20u32, enabled)] {
+            bytes.extend_from_slice(&frame.to_le_bytes());
+            bytes.push(1); // visible
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&field);
+            bytes.push(u8::from(state));
+        }
+        Arc::new(VmdAnimation::from_vmd_file(crate::animation::VmdFile::load_from_bytes(&bytes).unwrap()))
+    }
+
+    #[test]
+    fn pz_fk_leg_ik_policy_replacement_additive_and_calibration() {
+        let (mut model, joints) = leg_ik_policy_model();
+        let empty = Arc::new(VmdAnimation::from_motion(crate::animation::Motion::new()));
+        let off = ik_switch_animation("左足ＩＫ", false);
+        let on = ik_switch_animation("左足ＩＫ", true);
+        // Reuse the same model to catch stale IK rotations and per-frame reset bugs.
+        for (suppressed, layers, expected) in [
+            (false, vec![], true), // upstream/calibration
+            (true, vec![], false),
+            (true, vec![(on.clone(), 0.0, true)], false),
+            (true, vec![(empty.clone(), 0.0, false)], true),
+            (true, vec![(off.clone(), 0.0, false), (on.clone(), 0.0, true)], true),
+            (true, vec![], false), // stop/end/wait restores FK without residue
+            (false, vec![], true), // calibration remains possible after playback
+        ] {
+            model.pz_suppress_leg_ik = suppressed;
+            let explicit_off = layers.iter().any(|(clip, _, add)| !add && Arc::ptr_eq(clip, &off));
+            model.pz_vmd_layers = layers;
+            for _ in 0..2 {
+                model.tick_animation_internal(0.0, false);
+                // Model without Bullet still exercises post-physics solving explicitly.
+                model.update_node_animation(true);
+                for (n, &index) in joints.iter().enumerate() {
+                    let q = model.bone_manager.get_bone(index).unwrap().ik_rotate;
+                    let moved = q.dot(Quat::IDENTITY).abs() < 0.999;
+                    assert_eq!(moved, n == 8 || expected && !(n == 0 && explicit_off), "joint {n}");
+                }
+            }
+        }
+        for (frame, enabled) in [(0.0, false), (10.0, true), (20.0, false), (10.0, true)] {
+            model.pz_suppress_leg_ik = true;
+            model.pz_vmd_layers = vec![(off.clone(), frame, false), (on.clone(), frame, true)];
+            model.tick_animation_internal(0.0, false);
+            let moved = model.bone_manager.get_bone(joints[0]).unwrap().ik_rotate.dot(Quat::IDENTITY).abs() < 0.999;
+            assert_eq!(moved, enabled, "replacement IK keyframe at {frame}");
+        }
+        // The last replacement restores defaults; earlier replacement switches cannot leak.
+        model.pz_vmd_layers = vec![(off, 0.0, false), (empty, 0.0, false)];
+        model.tick_animation_internal(0.0, true);
+        assert!(model.bone_manager.get_bone(joints[0]).unwrap().ik_rotate.dot(Quat::IDENTITY).abs() < 0.999);
+    }
 
     fn make_neck_head_test_model(neck_name: &str, head_parent: i32) -> MmdModel {
         let mut model = MmdModel::new();

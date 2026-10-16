@@ -20,6 +20,17 @@ const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
 
+/// Instance policy; calibration temporarily opts out, upstream defaults stay intact.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZLegIKSuppressed(
+    _env: JNIEnv, _class: JClass, model: jlong, suppressed: jboolean,
+) {
+    let models = MODELS.read().unwrap();
+    if let Some(model) = models.get(&model) {
+        model.lock().unwrap().pz_suppress_leg_ik = suppressed != 0;
+    }
+}
+
 /// Native-space QPS deltas for the optional original PZ turning overlay.
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZActionTurnTransforms(
@@ -244,6 +255,29 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_UpdateModel(
 // ============================================================================
 // 顶点数据函数
 // ============================================================================
+
+/// PZ Debug: evaluate exactly once and copy three native-order u64 CPU durations.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_UpdateModelProfiled(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    delta_time: jfloat,
+    buffer: JByteBuffer,
+) -> jboolean {
+    let dst = match env.get_direct_buffer_address(&buffer) {
+        Ok(p) if env.get_direct_buffer_capacity(&buffer).unwrap_or(0) >= 24 => p,
+        _ => return 0,
+    };
+    let models = MODELS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(model_arc) = models.get(&handle) {
+        let mut model = model_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let timings = model.tick_animation_measured(delta_time, true, true);
+        unsafe { ptr::copy_nonoverlapping(timings.as_ptr() as *const u8, dst, 24); }
+        return 1;
+    }
+    0
+}
 
 /// 获取顶点数量
 #[no_mangle]
