@@ -2229,6 +2229,24 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_CopyCameraSkinningMat
 }
 
 /// 获取顶点骨骼索引数据指针（ivec4 格式，用于 GPU 蒙皮）
+/// Read-only secondary view. Validate capacity before taking mutable buffer slices.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_CopyCharacterWindowGeometry(
+    env: JNIEnv, _class: JClass, model: jlong, buffer: JByteBuffer,
+) -> jint {
+    let models = MODELS.read().unwrap();
+    let Some(model_arc) = models.get(&model) else { return 0; };
+    let model = model_arc.lock().unwrap();
+    let count = model.vertices.len();
+    let Some(bytes) = count.checked_mul(24) else { return 0; };
+    if count == 0 || bytes > env.get_direct_buffer_capacity(&buffer).unwrap_or(0) { return 0; }
+    let Ok(dst) = env.get_direct_buffer_address(&buffer) else { return 0; };
+    if dst.align_offset(std::mem::align_of::<f32>()) != 0 { return 0; }
+    let output = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, count * 6) };
+    if model.copy_character_window_geometry(output) { count as jint } else { 0 }
+}
+
+/// 获取顶点骨骼索引数据指针（ivec4 格式，用于 GPU 蒙皮）
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetBoneIndices(
     _env: JNIEnv,

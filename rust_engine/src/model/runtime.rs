@@ -845,6 +845,39 @@ impl MmdModel {
         }
     }
 
+    /// A second view of the evaluated frame, before head collapse. Never ticks
+    /// animation/IK/physics or changes the primary view's matrices and vertices.
+    /// Layout: all positions (3 floats/vertex), then all normals.
+    pub fn copy_character_window_geometry(&self, output: &mut [f32]) -> bool {
+        let count = self.vertices.len();
+        if output.len() != count * 6 || self.weights.len() != count { return false; }
+        let mut positions: Vec<Vec3> = self.vertices.iter().map(|v| v.position).collect();
+        let mut effective = vec![0.0; self.morph_manager.morph_count()];
+        self.morph_manager.compute_effective_weights_into(&mut effective);
+        for (index, weight) in effective.iter().copied().enumerate() {
+            if weight == 0.0 { continue; }
+            let Some(morph) = self.morph_manager.get_morph(index) else { continue; };
+            if morph.morph_type != crate::morph::MorphType::Vertex { continue; }
+            for offset in &morph.vertex_offsets {
+                if let Some(position) = positions.get_mut(offset.vertex_index as usize) {
+                    *position += offset.offset * weight;
+                }
+            }
+        }
+        let matrices = self.camera_skinning_matrices();
+        let vertices = &self.vertices;
+        let weights = &self.weights;
+        let (pos, norm) = output.split_at_mut(count * 3);
+        pos.par_chunks_mut(3).zip(norm.par_chunks_mut(3)).enumerate()
+            .for_each(|(index, (p, n))| {
+                let (position, normal) = compute_vertex_skinning(positions[index],
+                    vertices[index].normal, &weights[index], matrices);
+                p.copy_from_slice(&position.to_array());
+                n.copy_from_slice(&normal.to_array());
+            });
+        true
+    }
+
     /// Eye-tail anchor from the view-following pose before render-only head scaling.
     pub fn camera_eye_tail_midpoint(&self) -> Vec3 {
         let matrices = self.camera_skinning_matrices();
@@ -3223,6 +3256,34 @@ mod tests {
         model.pz_vmd_layers = vec![(off, 0.0, false), (empty, 0.0, false)];
         model.tick_animation_internal(0.0, true);
         assert!(model.bone_manager.get_bone(joints[0]).unwrap().ik_rotate.dot(Quat::IDENTITY).abs() < 0.999);
+    }
+
+    #[test]
+    fn character_window_geometry_preserves_primary_pose_and_group_vertex_morphs() {
+        use crate::morph::{Morph, MorphType, VertexMorphOffset, GroupMorphOffset};
+        let mut model = make_neck_head_test_model("Neck", 0);
+        model.vertices = vec![RuntimeVertex {position: Vec3::new(0.1,1.8,0.2),normal: Vec3::Z,uv: Vec2::ZERO}];
+        model.weights = vec![VertexWeight::Bdef1{bone:1}];
+        model.update_positions = vec![Vec3::ZERO];model.update_normals=vec![Vec3::ZERO];model.update_uvs=vec![Vec2::ZERO];
+        let mut vertex = Morph::new("face".into(),MorphType::Vertex);
+        vertex.vertex_offsets.push(VertexMorphOffset{vertex_index:0,offset:Vec3::new(0.1,0.2,0.3)});
+        vertex.weight=0.25;
+        model.morph_manager.add_morph(vertex);
+        let mut group = Morph::new("group".into(),MorphType::Group);
+        group.group_offsets.push(GroupMorphOffset{morph_index:0,influence:0.5});group.weight=0.5;
+        model.morph_manager.add_morph(group);
+        model.begin_animation();model.update_morph_animation();model.update_node_animation(false);model.update_node_animation(true);model.end_animation();
+        model.set_first_person_presentation(true,true);model.update();
+        let primary=model.update_positions_raw.clone();
+        let matrices=model.bone_manager.get_skinning_matrices().to_vec();
+        let mut secondary=vec![0.0;6];assert!(model.copy_character_window_geometry(&mut secondary));
+        let expected=model.camera_skinning_matrices()[1].transform_point3(Vec3::new(0.15,1.9,0.35));
+        assert!(Vec3::from_slice(&secondary[..3]).abs_diff_eq(expected,1e-6));
+        assert!(Vec3::from_slice(&secondary[3..]).abs_diff_eq(Vec3::Z,1e-6));
+        assert!(!Vec3::from_slice(&primary).abs_diff_eq(expected,0.01));
+        assert_eq!(primary,model.update_positions_raw);assert_eq!(matrices,model.bone_manager.get_skinning_matrices());
+        assert!(!model.copy_character_window_geometry(&mut [0.0;5]));
+        let repeat=secondary.clone();assert!(model.copy_character_window_geometry(&mut secondary));assert_eq!(repeat,secondary);
     }
 
     fn make_neck_head_test_model(neck_name: &str, head_parent: i32) -> MmdModel {
