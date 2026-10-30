@@ -231,6 +231,34 @@ impl MorphManager {
         }
     }
 
+    /// Same Group/Flip expansion as application, without changing the live pose.
+    /// PZ captures this on the game thread before native animation is evaluated.
+    pub fn root_vertical_offset(&self, root: usize, weights: Option<&[f32]>) -> f32 {
+        let mut effective = vec![0.0; self.morphs.len()];
+        for (i, morph) in self.morphs.iter().enumerate() {
+            let weight = weights.map_or(morph.weight, |w| w.get(i).copied().unwrap_or(0.0));
+            if weight.is_finite() && weight.abs() > MORPH_WEIGHT_EPSILON {
+                accumulate_effective_weight(&self.morphs, i, weight, &mut effective, 0);
+            }
+        }
+        let mut height = 0.0;
+        for (morph, weight) in self.morphs.iter().zip(effective) {
+            if weight == 0.0 || morph.morph_type != MorphType::Bone { continue; }
+            for offset in &morph.bone_offsets {
+                if offset.bone_index as usize != root { continue; }
+                // Mixed root translation/rotation stays entirely in the skeleton.
+                // Other bones, vertices and materials are never suppressed.
+                let t = offset.translation;
+                let q = offset.rotation;
+                if !t.is_finite() || !q.is_finite() || t.x.abs() > 1e-6 || t.z.abs() > 1e-6
+                    || q.x.abs() > 1e-6 || q.y.abs() > 1e-6 || q.z.abs() > 1e-6
+                    || (q.w.abs() - 1.0).abs() > 1e-6 { return 0.0; }
+                height += t.y * weight;
+            }
+        }
+        if height.is_finite() { height } else { 0.0 }
+    }
+
     pub fn memory_usage(&self) -> u64 {
         use std::mem::size_of;
         let mut total: u64 = 0;

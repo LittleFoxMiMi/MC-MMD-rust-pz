@@ -20,6 +20,36 @@ const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
 
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZRootMorphPlacement(
+    _env: JNIEnv, _class: JClass, model: jlong, enabled: jboolean,
+) -> jboolean {
+    let models = MODELS.read().unwrap();
+    models.get(&model).map_or(0, |m|
+        m.lock().unwrap().set_pz_root_morph_placement(enabled != 0) as jboolean)
+}
+
+/// Read-only prediction from a scene's dense, VMD-composed direct weights.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_PredictPZRootMorphHeight(
+    env: JNIEnv, _class: JClass, model: jlong, weights: JFloatArray,
+) -> jfloat {
+    let count = env.get_array_length(&weights).unwrap_or(0) as usize;
+    if count > 100000 { return 0.0; }
+    let mut values = vec![0.0; count];
+    if env.get_float_array_region(&weights, 0, &mut values).is_err() { return 0.0; }
+    let models = MODELS.read().unwrap();
+    models.get(&model).map_or(0.0, |m| m.lock().unwrap().predict_pz_root_morph_height(&values))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetPZRootMorphHeight(
+    _env: JNIEnv, _class: JClass, model: jlong,
+) -> jfloat {
+    let models = MODELS.read().unwrap();
+    models.get(&model).map_or(0.0, |m| m.lock().unwrap().pz_root_morph_height)
+}
+
 /// Instance policy; calibration temporarily opts out, upstream defaults stay intact.
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZLegIKSuppressed(

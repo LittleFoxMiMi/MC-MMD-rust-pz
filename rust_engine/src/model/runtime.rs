@@ -188,6 +188,9 @@ pub struct MmdModel {
     pub pz_suppress_leg_ik: bool,
     pub pz_action_turns: Vec<(usize, Vec3, Quat, Vec3)>,
     pub pz_manual_morphs: Vec<(usize, f32)>,
+    /// Opt-in PZ placement policy; upstream and calibration retain normal Morphs.
+    pz_root_morph_root: Option<usize>,
+    pub pz_root_morph_height: f32,
 
     // ======== 第一人称模式 ========
     /// 第一人称模式是否启用
@@ -318,6 +321,8 @@ impl MmdModel {
             pz_suppress_leg_ik: false,
             pz_action_turns: Vec::new(),
             pz_manual_morphs: Vec::new(),
+            pz_root_morph_root: None,
+            pz_root_morph_height: 0.0,
             vr_hand_mode: 0,
             hand_submesh_flags: Vec::new(),
             hand_detection_initialized: false,
@@ -1045,6 +1050,43 @@ impl MmdModel {
         self.bone_manager.end_update();
     }
 
+    /// Accept only a unique top-level root governing the complete rig.
+    /// Names are irrelevant; disconnected rigs/cycles are deliberately excluded.
+    pub fn set_pz_root_morph_placement(&mut self, enabled: bool) -> bool {
+        self.pz_root_morph_root = None;
+        self.pz_root_morph_height = 0.0;
+        if !enabled { return false; }
+        let count = self.bone_manager.bone_count();
+        let roots: Vec<_> = (0..count).filter(|&i|
+            self.bone_manager.get_bone(i).unwrap().parent_index < 0).collect();
+        if roots.len() != 1 { return false; }
+        let root = roots[0];
+        let bone = self.bone_manager.get_bone(root).unwrap();
+        if bone.append_config.is_some() || bone.ik_config.is_some()
+            || bone.rest_rotation.dot(Quat::IDENTITY).abs() < 1.0 - 1e-6 { return false; }
+        for i in 0..count {
+            let link = self.bone_manager.get_bone(i).unwrap();
+            if link.is_append_translate() && link.append_config.as_ref().is_some_and(|a|
+                a.parent == root as i32 && a.rate != 0.0) { return false; }
+            let mut at = i;
+            let mut reached = false;
+            for _ in 0..=count {
+                if at == root { reached = true; break; }
+                let parent = self.bone_manager.get_bone(at).unwrap().parent_index;
+                if parent < 0 || parent as usize >= count { break; }
+                at = parent as usize;
+            }
+            if !reached { return false; }
+        }
+        self.pz_root_morph_root = Some(root);
+        true
+    }
+
+    pub fn predict_pz_root_morph_height(&self, weights: &[f32]) -> f32 {
+        self.pz_root_morph_root.map_or(0.0, |root|
+            self.morph_manager.root_vertical_offset(root, Some(weights)))
+    }
+
     /// 更新 Morph 动画
     pub fn update_morph_animation(&mut self) {
         // 先将 update_positions 重置为原始顶点位置（因为 apply_morphs 是累加操作）
@@ -1054,8 +1096,14 @@ impl MmdModel {
             }
         }
         // 应用所有 Morph 变形（顶点/骨骼/材质/UV/Group）
+        self.pz_root_morph_height = self.pz_root_morph_root.map_or(0.0, |root|
+            self.morph_manager.root_vertical_offset(root, None));
         self.morph_manager
             .apply_morphs(&mut self.bone_manager, &mut self.update_positions);
+        if let Some(root) = self.pz_root_morph_root {
+            // Remove only the Morph contribution. PZ/VMD root motion survives.
+            self.bone_manager.get_bone_mut(root).unwrap().animation_translate.y -= self.pz_root_morph_height;
+        }
 
         // 将 UV Morph 偏移应用到 UV 缓冲区
         let uv_deltas = self.morph_manager.get_uv_morph_deltas();
@@ -3162,6 +3210,94 @@ mod tests {
     use crate::skeleton::BoneLink;
     use crate::vr::{VrTrackedPose, XR_TO_MODEL_SCALE};
     use crate::vrm_runtime::{ArmIkHandCalibration, BodyTrackingCalibration};
+
+    fn root_morph_model() -> MmdModel {
+        use crate::morph::{Morph, MorphType, BoneMorphOffset, GroupMorphOffset};
+        let mut model = MmdModel::new();
+        model.bone_manager.add_bone(BoneLink::new("root-with-any-name".into()));
+        let mut child = BoneLink::new("child".into());
+        child.parent_index = 0;child.initial_position = Vec3::Y;
+        model.bone_manager.add_bone(child);model.bone_manager.build_hierarchy();
+        for (name, bone, y) in [("height", 0, 0.64), ("local", 1, 0.3)] {
+            let mut morph = Morph::new(name.into(), MorphType::Bone);
+            morph.bone_offsets.push(BoneMorphOffset {bone_index: bone,
+                translation: Vec3::Y*y, rotation: glam::Vec4::W});
+            model.morph_manager.add_morph(morph);
+        }
+        let mut group = Morph::new("group".into(),MorphType::Group);
+        group.group_offsets.push(GroupMorphOffset {morph_index: 0,influence: 0.5});
+        model.morph_manager.add_morph(group);
+        let mut flip = Morph::new("flip".into(),MorphType::Flip);
+        flip.group_offsets.push(GroupMorphOffset {morph_index: 2,influence: 0.4});
+        flip.group_offsets.push(GroupMorphOffset {morph_index: 0,influence: 0.75});
+        model.morph_manager.add_morph(flip);
+        model
+    }
+
+    #[test]
+    fn pz_root_morph_group_flip_and_animation_motion() {
+        let mut model = root_morph_model();
+        assert!(model.set_pz_root_morph_placement(true));
+        for (weights, expected) in [([0.0,0.0,0.5,0.0],0.16),
+            ([0.25,0.0,1.0,0.0],0.48),([0.0,1.0,0.0,0.25],0.128),
+            ([0.0,0.0,0.0,0.75],0.48),([0.0;4],0.0),([0.0005,0.0,0.0,0.0],0.0)] {
+            assert!((model.predict_pz_root_morph_height(&weights)-expected).abs()<1e-6);
+            model.begin_animation();model.morph_manager.reset_all_weights();
+            for (i,w) in weights.iter().enumerate(){model.morph_manager.set_morph_weight(i,*w);}
+            // Real root animation and local bone Morph must survive extraction.
+            model.bone_manager.get_bone_mut(0).unwrap().animation_translate = Vec3::new(2.0,3.0,-4.0);
+            model.update_morph_animation();
+            assert!((model.pz_root_morph_height-expected).abs()<1e-6);
+            assert!((model.bone_manager.get_bone(0).unwrap().animation_translate-Vec3::new(2.0,3.0,-4.0)).length()<1e-6);
+            assert!((model.bone_manager.get_bone(1).unwrap().animation_translate.y-0.3*weights[1]).abs()<1e-6);
+        }
+        // Opt-in only: callers using upstream behavior retain the root Morph.
+        model.set_pz_root_morph_placement(false);model.begin_animation();
+        model.morph_manager.set_morph_weight(0,1.0);model.update_morph_animation();
+        assert!((model.bone_manager.get_bone(0).unwrap().animation_translate.y-0.64).abs()<1e-6);
+    }
+
+    #[test]
+    fn pz_root_morph_mixed_or_disconnected_rigs_stay_native() {
+        let mut model = root_morph_model();assert!(model.set_pz_root_morph_placement(true));
+        let weights = [1.0,0.0,0.0,0.0];
+        model.morph_manager.get_morph_mut(0).unwrap().bone_offsets[0].translation.x = 0.1;
+        assert_eq!(model.predict_pz_root_morph_height(&weights),0.0);
+        model.morph_manager.get_morph_mut(0).unwrap().bone_offsets[0].translation.x = 0.0;
+        model.morph_manager.get_morph_mut(0).unwrap().bone_offsets[0].rotation = glam::Vec4::from_array(Quat::from_rotation_x(0.1).to_array());
+        assert_eq!(model.predict_pz_root_morph_height(&weights),0.0);
+        // A separate root must never be moved with the rest of the model.
+        model.bone_manager.add_bone(BoneLink::new("disconnected".into()));
+        assert!(!model.set_pz_root_morph_placement(true));
+        assert_eq!(model.predict_pz_root_morph_height(&weights),0.0);
+        let mut model = root_morph_model();
+        model.bone_manager.get_bone_mut(1).unwrap().parent_index=1;
+        assert!(!model.set_pz_root_morph_placement(true));
+        let mut model = root_morph_model();
+        let child = model.bone_manager.get_bone_mut(1).unwrap();
+        child.flags.insert(crate::skeleton::BoneFlags::APPEND_TRANSLATE);
+        child.append_config=Some(crate::skeleton::AppendConfig {parent:0,rate:0.5});
+        assert!(!model.set_pz_root_morph_placement(true));
+    }
+
+    #[test]
+    fn pz_root_morph_vmd_replacement_additive_preserves_root_motion() {
+        use crate::animation::{Motion,BoneKeyframe,MorphKeyframe};
+        let mut model = root_morph_model();assert!(model.set_pz_root_morph_placement(true));
+        let mut motion = Motion::new();
+        motion.insert_bone_keyframe("root-with-any-name",BoneKeyframe::with_transform(0,Vec3::new(1.0,2.0,3.0),Quat::IDENTITY));
+        motion.insert_morph_keyframe("group",MorphKeyframe::new(0,0.5));
+        let clip = Arc::new(VmdAnimation::from_motion(motion));
+        model.pz_manual_morphs = vec![(0,1.0),(2,0.0)];
+        model.pz_vmd_layers = vec![(clip.clone(),0.0,false)];
+        model.tick_animation_measured(0.0,false,false);
+        assert!((model.pz_root_morph_height-0.16).abs()<1e-6);
+        assert!((model.bone_manager.get_bone(0).unwrap().animation_translate.y-2.0).abs()<1e-6);
+        model.pz_vmd_layers = vec![(clip,0.0,true)];
+        model.tick_animation_measured(0.0,false,false);
+        assert!((model.pz_root_morph_height-0.8).abs()<1e-6);
+        assert!((model.bone_manager.get_bone(0).unwrap().animation_translate.y-2.0).abs()<1e-6);
+    }
 
     fn leg_ik_policy_model() -> (MmdModel, Vec<usize>) {
         use crate::skeleton::{BoneFlags, IkConfig, IkLink};
