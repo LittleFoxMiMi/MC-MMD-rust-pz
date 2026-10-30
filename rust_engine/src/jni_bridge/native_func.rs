@@ -61,6 +61,18 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZLegIKSuppressed(
     }
 }
 
+/// Optional per-submission policy; legacy callers retain replacement Morph clearing.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZManualMorphPreservation(
+    _env: JNIEnv, _class: JClass, model: jlong, enabled: jboolean,
+) -> jboolean {
+    let models = MODELS.read().unwrap();
+    if let Some(model) = models.get(&model) {
+        model.lock().unwrap().pz_preserve_manual_morphs = enabled != 0;
+        1
+    } else { 0 }
+}
+
 /// Native-space QPS deltas for the optional original PZ turning overlay.
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZActionTurnTransforms(
@@ -113,6 +125,8 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAnimationState(
     if let Some(model) = models.get(&model) {
         let mut model = model.lock().unwrap();
         model.pz_vmd_layers = layers;
+        // Legacy callers and the next scene always start with the original policy.
+        model.pz_preserve_manual_morphs = false;
         let count = model.morph_manager.morph_count();
         model.pz_manual_morphs = i.iter().zip(w.iter()).filter_map(|(&index, &weight)| {
             if index < 0 || index as usize >= count || !weight.is_finite() { None }

@@ -188,6 +188,8 @@ pub struct MmdModel {
     pub pz_suppress_leg_ik: bool,
     pub pz_action_turns: Vec<(usize, Vec3, Quat, Vec3)>,
     pub pz_manual_morphs: Vec<(usize, f32)>,
+    /// Explicit menu/wheel playback keeps the user's Morph baseline on replacement.
+    pub pz_preserve_manual_morphs: bool,
     /// Opt-in PZ placement policy; upstream and calibration retain normal Morphs.
     pz_root_morph_root: Option<usize>,
     pub pz_root_morph_height: f32,
@@ -321,6 +323,7 @@ impl MmdModel {
             pz_suppress_leg_ik: false,
             pz_action_turns: Vec::new(),
             pz_manual_morphs: Vec::new(),
+            pz_preserve_manual_morphs: false,
             pz_root_morph_root: None,
             pz_root_morph_height: 0.0,
             vr_hand_mode: 0,
@@ -2575,6 +2578,13 @@ impl MmdModel {
                 self.bone_manager.reset_all_transforms();
                 self.bone_manager.reset_all_ik_enabled();
                 self.morph_manager.reset_all_weights();
+                if self.pz_preserve_manual_morphs {
+                    // Restore the baseline, not the preceding layer's expressions.
+                    // The VMD then replaces only the Morph names it actually owns.
+                    for &(index, weight) in &self.pz_manual_morphs {
+                        self.morph_manager.set_morph_weight(index, weight);
+                    }
+                }
                 animation.evaluate(*frame, &mut self.bone_manager, &mut self.morph_manager);
             }
         }
@@ -3297,6 +3307,39 @@ mod tests {
         model.tick_animation_measured(0.0,false,false);
         assert!((model.pz_root_morph_height-0.8).abs()<1e-6);
         assert!((model.bone_manager.get_bone(0).unwrap().animation_translate.y-2.0).abs()<1e-6);
+    }
+
+    #[test]
+    fn pz_manual_playback_morph_baseline_sparse_tracks_and_policy_reset() {
+        use crate::animation::{Motion, BoneKeyframe, MorphKeyframe};
+        let mut model = root_morph_model();assert!(model.set_pz_root_morph_placement(true));
+        model.pz_manual_morphs = vec![(0,0.25),(1,0.1),(2,0.6),(3,0.0)];
+        let mut earlier = Motion::new();
+        earlier.insert_morph_keyframe("flip",MorphKeyframe::new(0,1.0));
+        let earlier = Arc::new(VmdAnimation::from_motion(earlier));
+        let mut last = Motion::new();
+        last.insert_bone_keyframe("root-with-any-name",BoneKeyframe::with_transform(0,Vec3::Y*2.0,Quat::IDENTITY));
+        last.insert_morph_keyframe("local",MorphKeyframe::new(0,0.4));
+        let last = Arc::new(VmdAnimation::from_motion(last));
+        let mut additive = Motion::new();
+        additive.insert_morph_keyframe("group",MorphKeyframe::new(0,0.5));
+        let additive = Arc::new(VmdAnimation::from_motion(additive));
+        // Alternate explicit playback and the original automatic/action policy on one model.
+        for preserve in [false,true,true,false,true,false] {
+            model.pz_preserve_manual_morphs=preserve;
+            model.pz_vmd_layers=vec![(earlier.clone(),0.0,false),(last.clone(),0.0,false),(additive.clone(),0.0,true)];
+            for _ in 0..3 {
+                model.tick_animation_measured(0.0,false,false);
+                assert!((model.pz_root_morph_height-if preserve {0.48} else {0.16}).abs()<1e-6);
+                assert!((model.morph_manager.get_morph_weight(1)-0.4).abs()<1e-6); // same name belongs to VMD
+                assert_eq!(model.morph_manager.get_morph_weight(3),0.0); // previous replacement cannot leak
+                assert!((model.bone_manager.get_bone(0).unwrap().animation_translate.y-2.0).abs()<1e-6);
+            }
+        }
+        model.pz_vmd_layers.clear();model.pz_preserve_manual_morphs=false;
+        model.tick_animation_measured(0.0,false,false);
+        assert!((model.pz_root_morph_height-0.352).abs()<1e-6);
+        assert!((model.morph_manager.get_morph_weight(1)-0.1).abs()<1e-6);
     }
 
     fn leg_ik_policy_model() -> (MmdModel, Vec<usize>) {
