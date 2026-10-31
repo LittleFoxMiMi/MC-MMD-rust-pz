@@ -331,6 +331,34 @@ impl MMDPhysics {
         bones.apply_physics_transforms(transforms, rotation_only);
     }
 
+    pub fn sync_weapon_bodies(&mut self, bones: &[Mat4], frame: Mat4) {
+        if self.needs_initialize {
+            self.initialize(bones);
+            for rb in &self.rigid_bodies {
+                if rb.bone_index < 0 {
+                    if let Some(body) = &rb.bullet_body {
+                        body.reset_transform(super::inv_z(frame) * rb.initial_transform);
+                    }
+                }
+            }
+        }
+        self.sync_bodies(bones);
+        for rb in &self.rigid_bodies {
+            if rb.bone_index < 0 && rb.physics_mode == PhysicsMode::FollowBone {
+                if let Some(body) = &rb.bullet_body {
+                    body.set_transform(super::inv_z(frame) * rb.initial_transform);
+                }
+            }
+        }
+    }
+
+    pub fn sync_weapon_bones(&mut self, bones: &mut crate::skeleton::BoneSet, inverse: Mat4) {
+        bones.set_physics_bone_indices(&self.dynamic_bone_indices);
+        self.get_dynamic_bone_transforms(bones.bone_count());
+        for (_, matrix) in &mut self.dynamic_bone_buf { *matrix = inverse * *matrix; }
+        bones.apply_physics_transforms(&self.dynamic_bone_buf, &self.rotation_only_bone_indices);
+    }
+
     /// 初始化物理（commitBodyStates 的初始版本）
     ///
     /// 在骨骼初始姿态确定后调用，将所有刚体设置到正确的初始位置（左手空间）。

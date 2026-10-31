@@ -122,6 +122,7 @@ pub struct MmdModel {
 
     // 模型全局变换
     model_transform: Mat4,
+    pz_weapon_transform: Option<Mat4>,
 
     // 物理系统
     physics: Option<MMDPhysics>,
@@ -294,6 +295,7 @@ impl MmdModel {
             is_vrm: false,
             vrm_runtime_state: None,
             model_transform: Mat4::IDENTITY,
+            pz_weapon_transform: None,
             physics: None,
             physics_enabled: false,
             physics_bone_transforms_buf: Vec::new(),
@@ -1792,6 +1794,10 @@ impl MmdModel {
         self.model_transform = transform;
     }
 
+    pub fn set_pz_weapon_transform(&mut self, transform: Mat4) {
+        self.pz_weapon_transform = Some(transform);
+    }
+
     /// 设置模型位置和朝向（用于惯性计算）
     pub fn set_model_position_and_yaw(&mut self, x: f32, y: f32, z: f32, yaw: f32) {
         let cos_y = yaw.cos();
@@ -2776,6 +2782,21 @@ impl MmdModel {
 
         // 拆分借用：先取出 physics 避免同时借用 self
         let mut physics = self.physics.take().unwrap();
+
+        if let Some(frame) = self.pz_weapon_transform {
+            // A weapon can rotate on every axis. Simulate its complete original
+            // rig in a small world-space Bullet frame, then return results to
+            // model space; gravity and joint anchors therefore remain coherent.
+            // This Bullet frame already contains the complete weapon rotation.
+            // Gravity is a world vector; never rotate it by the mount or rig.
+            physics.set_gravity(0.0, config.gravity_y, 0.0);
+            for bone in &mut self.physics_bone_transforms_buf { *bone = frame * *bone; }
+            physics.sync_weapon_bodies(&self.physics_bone_transforms_buf, frame);
+            physics.step_simulation(delta_time, &config);
+            physics.sync_weapon_bones(&mut self.bone_manager, frame.inverse());
+            self.physics = Some(physics);
+            return;
+        }
 
         // 1. 同步运动学刚体
         physics.sync_bodies_with_model_velocity(

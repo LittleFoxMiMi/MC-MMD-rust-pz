@@ -21,6 +21,23 @@ const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
 
 #[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZWeaponTransform(
+    env: JNIEnv, _class: JClass, handle: jlong, values: JFloatArray,
+) -> jboolean {
+    let mut data = [0.0f32; 16];
+    if env.get_array_length(&values).unwrap_or(0) != 16
+        || env.get_float_array_region(&values, 0, &mut data).is_err()
+        || data.iter().any(|x| !x.is_finite()) { return 0; }
+    let frame = glam::Mat4::from_cols_array(&data);
+    // The adapter strips uniform display scale and reflections before submission.
+    if (frame.determinant()-1.0).abs() > 0.01 { return 0; }
+    let models = MODELS.read().unwrap();
+    let Some(model) = models.get(&handle) else { return 0; };
+    model.lock().unwrap().set_pz_weapon_transform(frame);
+    1
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZRootMorphPlacement(
     _env: JNIEnv, _class: JClass, model: jlong, enabled: jboolean,
 ) -> jboolean {
