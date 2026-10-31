@@ -178,3 +178,50 @@ fn movement_inertia_responds_to_acceleration_and_stop_at_any_frame_rate() {
         );
     }
 }
+
+#[test]
+fn weapon_kinematic_velocity_and_dynamic_travel_follow_render_time() {
+    use mmd::pmx::rigid_body::{RigidBody, RigidBodyMode, RigidBodyShape};
+    use mmd_engine::physics::{MMDPhysics, PhysicsConfig};
+    let anchor = RigidBody {
+        local_name: "moving weapon anchor".into(),
+        universal_name: String::new(), bone_index: 0, group: 0,
+        un_collision_group_flag: 0xffff, shape: RigidBodyShape::Sphere,
+        size: [0.1, 0.0, 0.0], position: [0.0; 3], rotation: [0.0; 3],
+        mass: 0.0, move_attenuation: 0.0, rotation_attenuation: 0.0,
+        repulsion: 0.0, friction: 0.0, mode: RigidBodyMode::Static,
+    };
+    let mut dynamic = anchor.clone();
+    dynamic.bone_index = -1;dynamic.position = [0.0, 10.0, 0.0];
+    dynamic.mass = 1.0;dynamic.mode = RigidBodyMode::Dynamic;
+    let config = PhysicsConfig { gravity_y: 0.0, ..PhysicsConfig::default() };
+    for fps in [30, 60, 100, 144, 240] {
+        let mut physics = MMDPhysics::new().unwrap();
+        physics.build_physics(&[anchor.clone(), dynamic.clone()], &[], &[Mat4::IDENTITY]);
+        physics.set_gravity(0.0, 0.0, 0.0);
+        physics.simulate_weapon(&[Mat4::IDENTITY], Mat4::IDENTITY, 0.0, &config);
+        let speed = 50.0;
+        physics.rigid_bodies[1].bullet_body.as_ref().unwrap().set_linear_velocity(speed, 0.0, 0.0);
+        for tick in 1..=fps*2 {
+            let dt = 1.0 / fps as f32;
+            let position = speed * tick as f32 * dt;
+            let frame = Mat4::from_translation(Vec3::new(position, 0.0, 0.0));
+            physics.simulate_weapon(&[Mat4::IDENTITY], frame, dt, &config);
+            let anchor_body = physics.rigid_bodies[0].bullet_body.as_ref().unwrap();
+            assert!((anchor_body.get_linear_velocity().x - speed).abs() < 0.02,
+                "uneven kinematic velocity at {fps} FPS tick {tick}: {:?}", anchor_body.get_linear_velocity());
+            assert!((anchor_body.get_position().x - position).abs() < 0.001);
+            let body = physics.rigid_bodies[1].bullet_body.as_ref().unwrap();
+            assert!((body.get_linear_velocity().x - speed).abs() < 0.001,
+                "weapon owner travel was clamped at {fps} FPS");
+            let before = body.get_position();
+            physics.simulate_weapon(&[Mat4::IDENTITY], frame, 0.0, &config);
+            let body = physics.rigid_bodies[1].bullet_body.as_ref().unwrap();
+            assert!((body.get_position() - before).length() < 0.00001,
+                "zero-time upload advanced a dynamic body");
+        }
+        physics.reset();
+        physics.simulate_weapon(&[Mat4::IDENTITY], Mat4::IDENTITY, 0.0, &config);
+        assert!(physics.rigid_bodies[1].bullet_body.as_ref().unwrap().get_linear_velocity().length() < 0.00001);
+    }
+}

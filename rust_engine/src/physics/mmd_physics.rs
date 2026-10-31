@@ -42,6 +42,8 @@ pub struct MMDPhysics {
     /// 上一帧模型世界位置（用于计算移动速度实现惯性）
     prev_model_position: Option<Vec3>,
     prev_model_velocity: Vec3,
+    prev_weapon_frame: Option<Mat4>,
+    weapon_bone_buf: Vec<Mat4>,
     /// 等待下一帧完成动画/IK后，按当前姿态初始化动态体。
     needs_initialize: bool,
 }
@@ -71,6 +73,8 @@ impl MMDPhysics {
             dynamic_bone_buf: Vec::new(),
             prev_model_position: None,
             prev_model_velocity: Vec3::ZERO,
+            prev_weapon_frame: None,
+            weapon_bone_buf: Vec::new(),
             needs_initialize: true,
         })
     }
@@ -296,6 +300,10 @@ impl MMDPhysics {
         self.world
             .step(delta_time, self.max_substep_count, fixed_dt);
 
+        self.limit_velocity(config, Vec3::ZERO);
+    }
+
+    fn limit_velocity(&self, config: &PhysicsConfig, reference_velocity: Vec3) {
         // 速度钳制
         let max_lin = config.max_linear_velocity;
         let max_ang = config.max_angular_velocity;
@@ -307,10 +315,10 @@ impl MMDPhysics {
                 continue;
             }
             if let Some(ref body) = rb_data.bullet_body {
-                let lin_vel = body.get_linear_velocity();
+                let lin_vel = body.get_linear_velocity() - reference_velocity;
                 let lin_sq = lin_vel.length_squared();
                 if lin_sq > max_lin_sq {
-                    let clamped = lin_vel * (max_lin / lin_sq.sqrt());
+                    let clamped = reference_velocity + lin_vel * (max_lin / lin_sq.sqrt());
                     body.set_linear_velocity(clamped.x, clamped.y, clamped.z);
                 }
 
@@ -352,6 +360,57 @@ impl MMDPhysics {
         }
     }
 
+    /// Advance the mount and dynamics to the same time, including above 60 FPS.
+    /// Bullet's internal fixed-step accumulator samples a render-rate kinematic
+    /// target at uneven intervals and interpolates its dynamic results behind
+    /// that target. Explicit bounded substeps avoid both sources of impulses.
+    pub fn simulate_weapon(
+        &mut self,
+        bones: &[Mat4],
+        frame: Mat4,
+        delta: f32,
+        config: &PhysicsConfig,
+    ) {
+        let mut transformed = std::mem::take(&mut self.weapon_bone_buf);
+        transformed.resize(bones.len(), Mat4::IDENTITY);
+        let previous = if self.needs_initialize {
+            frame
+        } else {
+            self.prev_weapon_frame.unwrap_or(frame)
+        };
+        if !delta.is_finite() || delta <= 0.0 {
+            for (target, bone) in transformed.iter_mut().zip(bones) {
+                *target = frame * *bone;
+            }
+            self.sync_weapon_bodies(&transformed, frame);
+            self.world.step(0.0, 0, 1.0 / self.fps);
+        } else {
+            let steps = ((delta * self.fps).ceil() as i32).clamp(1, self.max_substep_count.max(1));
+            let dt = delta / steps as f32;
+            let (_, rotation0, position0) = previous.to_scale_rotation_translation();
+            let (_, rotation1, position1) = frame.to_scale_rotation_translation();
+            // Clamp unstable LOCAL motion, not the owner's travel speed. A
+            // running weapon can legitimately exceed 20 PMX units per second.
+            let v = (position1 - position0) / delta;
+            let velocity = Vec3::new(v.x, v.y, -v.z);
+            for step in 1..=steps {
+                let amount = step as f32 / steps as f32;
+                let mount = Mat4::from_rotation_translation(
+                    rotation0.slerp(rotation1, amount),
+                    position0.lerp(position1, amount),
+                );
+                for (target, bone) in transformed.iter_mut().zip(bones) {
+                    *target = mount * *bone;
+                }
+                self.sync_weapon_bodies(&transformed, mount);
+                self.world.step(dt, 0, dt);
+                self.limit_velocity(config, velocity);
+            }
+        }
+        self.prev_weapon_frame = Some(frame);
+        self.weapon_bone_buf = transformed;
+    }
+
     pub fn sync_weapon_bones(&mut self, bones: &mut crate::skeleton::BoneSet, inverse: Mat4) {
         bones.set_physics_bone_indices(&self.dynamic_bone_indices);
         self.get_dynamic_bone_transforms(bones.bone_count());
@@ -384,6 +443,7 @@ impl MMDPhysics {
     pub fn reset(&mut self) {
         self.prev_model_position = None;
         self.prev_model_velocity = Vec3::ZERO;
+        self.prev_weapon_frame = None;
         self.needs_initialize = true;
     }
 

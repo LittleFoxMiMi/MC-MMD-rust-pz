@@ -2790,9 +2790,7 @@ impl MmdModel {
             // This Bullet frame already contains the complete weapon rotation.
             // Gravity is a world vector; never rotate it by the mount or rig.
             physics.set_gravity(0.0, config.gravity_y, 0.0);
-            for bone in &mut self.physics_bone_transforms_buf { *bone = frame * *bone; }
-            physics.sync_weapon_bodies(&self.physics_bone_transforms_buf, frame);
-            physics.step_simulation(delta_time, &config);
+            physics.simulate_weapon(&self.physics_bone_transforms_buf, frame, delta_time, &config);
             physics.sync_weapon_bones(&mut self.bone_manager, frame.inverse());
             self.physics = Some(physics);
             return;
