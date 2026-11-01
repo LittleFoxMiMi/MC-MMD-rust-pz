@@ -347,25 +347,26 @@ fn read_camera_keyframe<R: Read>(reader: &mut R) -> Result<CameraKeyframe> {
         .map_err(|e| MmdError::VmdParse(format!("Failed to read camera interpolation: {}", e)))?;
 
     let interpolation = CameraInterpolation {
-        lookat_x: [interp_raw[0], interp_raw[1], interp_raw[2], interp_raw[3]],
-        lookat_y: [interp_raw[4], interp_raw[5], interp_raw[6], interp_raw[7]],
-        lookat_z: [interp_raw[8], interp_raw[9], interp_raw[10], interp_raw[11]],
+        // Camera bytes are x1,x2,y1,y2; bone interpolation already uses x1,y1,x2,y2.
+        lookat_x: [interp_raw[0], interp_raw[2], interp_raw[1], interp_raw[3]],
+        lookat_y: [interp_raw[4], interp_raw[6], interp_raw[5], interp_raw[7]],
+        lookat_z: [interp_raw[8], interp_raw[10], interp_raw[9], interp_raw[11]],
         angle: [
             interp_raw[12],
-            interp_raw[13],
             interp_raw[14],
+            interp_raw[13],
             interp_raw[15],
         ],
         distance: [
             interp_raw[16],
-            interp_raw[17],
             interp_raw[18],
+            interp_raw[17],
             interp_raw[19],
         ],
         fov: [
             interp_raw[20],
-            interp_raw[21],
             interp_raw[22],
+            interp_raw[21],
             interp_raw[23],
         ],
     };

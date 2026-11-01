@@ -502,6 +502,9 @@ pub struct CameraFrameTransform {
     pub rotation: Vec3,
     /// 视场角
     pub fov: f32,
+    pub forward: Vec3,
+    pub up: Vec3,
+    pub distance: f32,
     /// 是否透视
     pub is_perspective: bool,
 }
@@ -512,6 +515,9 @@ impl Default for CameraFrameTransform {
             position: Vec3::ZERO,
             rotation: Vec3::ZERO,
             fov: 30.0,
+            forward: -Vec3::Z,
+            up: Vec3::Y,
+            distance: 0.0,
             is_perspective: true,
         }
     }
@@ -625,11 +631,13 @@ impl CameraMotionTrack {
 
         // MMD → MC 坐标转换（Z 取反）
         let position_mc = Vec3::new(position_mmd.x, position_mmd.y, -position_mmd.z);
-        let look_at_mc = Vec3::new(look_at.x, look_at.y, -look_at.z);
 
         // 方向向量法提取 pitch/yaw（保证相机朝向 look_at）
-        let dir = (look_at_mc - position_mc).normalize_or_zero();
-        let mc_pitch = (-dir.y).asin();
+        // Orientation is authored independently of signed distance. Deriving it
+        // from the target flips the view when the camera crosses distance zero.
+        let authored_forward = view_orientation.inverse() * Vec3::Z;
+        let dir = Vec3::new(authored_forward.x, authored_forward.y, -authored_forward.z).normalize();
+        let mc_pitch = (-dir.y.clamp(-1.0, 1.0)).asin();
         let mc_yaw = (-dir.x).atan2(dir.z);
 
         // 从旋转矩阵提取 roll：比较实际 up 与无 roll 时的 up
@@ -653,6 +661,9 @@ impl CameraMotionTrack {
             position: position_mc,
             rotation: Vec3::new(mc_pitch, mc_yaw, mc_roll),
             fov,
+            forward: dir,
+            up: actual_up,
+            distance,
             is_perspective,
         }
     }
@@ -726,6 +737,11 @@ impl CameraMotionTrack {
         let f0 = self.seek_raw(frame_index, bezier_factory);
 
         if amount > 0.0 {
+            // Adjacent authored camera keys describe a cut, not a 1/30 s flight.
+            if self.keyframes.contains_key(&frame_index)
+                && self.keyframes.contains_key(&frame_index.saturating_add(1)) {
+                return Self::compute_camera_transform(f0.look_at, f0.angle, f0.distance, f0.fov, f0.is_perspective);
+            }
             let f1 = self.seek_raw(frame_index.saturating_add(1), bezier_factory);
 
             let raw = CameraRawFrame {
@@ -810,5 +826,35 @@ impl CameraMotionTrack {
 impl Default for CameraMotionTrack {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod camera_playback_tests {
+    use super::*;
+    use crate::animation::bezier_curve::BezierCurveCache;
+    #[test]
+    fn signed_distance_preserves_authored_orientation_and_vertical_basis() {
+        for pitch in [0.3, -std::f32::consts::FRAC_PI_2] {
+            let angle=Vec3::new(pitch,0.7,0.8);
+            let a=CameraMotionTrack::compute_camera_transform(Vec3::ZERO,angle,-20.0,9.0,true);
+            for distance in [0.0,3.0] {
+                let b=CameraMotionTrack::compute_camera_transform(Vec3::ZERO,angle,distance,9.0,true);
+                assert!(a.forward.abs_diff_eq(b.forward,1e-6));
+                assert!(a.up.abs_diff_eq(b.up,1e-6));
+                assert!(b.forward.dot(b.up).abs()<1e-5);
+                assert!((b.forward.length()-1.0).abs()<1e-5);
+            }
+        }
+    }
+    #[test]
+    fn adjacent_camera_keys_hold_before_cut() {
+        let mut track=CameraMotionTrack::new();
+        track.insert_keyframe(CameraKeyframe{frame_index:10,distance:-20.0,..Default::default()});
+        track.insert_keyframe(CameraKeyframe{frame_index:11,distance:-180.0,look_at:Vec3::X*100.0,..Default::default()});
+        let curves=BezierCurveCache::new();
+        let start=track.seek(10,&curves);
+        assert!(track.seek_precisely(10,0.99,&curves).position.abs_diff_eq(start.position,1e-5));
+        assert!(track.seek(11,&curves).position.distance(start.position)>100.0);
     }
 }

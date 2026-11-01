@@ -1177,6 +1177,24 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetCameraTransform(
 }
 
 /// 查询动画是否包含骨骼关键帧
+/// Position, forward, up, vertical FOV, distance (11 f32), perspective: 48 bytes.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetCameraView(
+    env: JNIEnv, _class: JClass, anim: jlong, frame: jfloat, buffer: JByteBuffer,
+) {
+    if !frame.is_finite() { return; }
+    let animations=ANIMATIONS.read().unwrap();
+    if let Some(animation)=animations.get(&anim) {
+        let t=animation.get_camera_transform(frame);
+        if env.get_direct_buffer_capacity(&buffer).unwrap_or(0)<48 {return;}
+        if let Ok(dst)=env.get_direct_buffer_address(&buffer) {
+            let values=[t.position.x,t.position.y,t.position.z,t.forward.x,t.forward.y,t.forward.z,t.up.x,t.up.y,t.up.z,t.fov,t.distance];
+            unsafe {std::ptr::copy_nonoverlapping(values.as_ptr(),dst as *mut f32,11);*((dst as *mut i32).add(11))=if t.is_perspective {1}else{0};}
+        }
+    }
+}
+
+/// 查询动画是否包含骨骼关键帧
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_HasBoneData(
     _env: JNIEnv,
