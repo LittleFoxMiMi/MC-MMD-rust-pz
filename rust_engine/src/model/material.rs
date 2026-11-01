@@ -14,6 +14,7 @@ pub struct MmdMaterial {
     pub edge_scale: f32,
     pub texture_index: i32,
     pub environment_index: i32,
+    pub environment_blend_mode: u8,
     pub toon_index: i32,
     pub draw_flags: u8,
 }
@@ -57,6 +58,7 @@ impl Default for MmdMaterial {
             edge_scale: 1.0,
             texture_index: -1,
             environment_index: -1,
+            environment_blend_mode: 0,
             toon_index: -1,
             draw_flags: 0,
         }

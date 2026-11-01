@@ -723,10 +723,14 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetMaterialTextureAdd
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetMaterialSpTextureMode(
     _env: JNIEnv,
     _class: JClass,
-    _model: jlong,
-    _pos: jlong,
+    model: jlong,
+    pos: jlong,
 ) -> jint {
-    0 // 默认无 sphere map
+    let models = MODELS.read().unwrap();
+    models.get(&model).and_then(|m| {
+        let model = m.lock().unwrap();
+        model.materials.get(pos as usize).map(|mat| mat.environment_blend_mode as jint)
+    }).unwrap_or(0)
 }
 
 /// 获取 Sphere 纹理乘法因子
