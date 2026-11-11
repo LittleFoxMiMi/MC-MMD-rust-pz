@@ -7,6 +7,8 @@ pub mod config;
 mod mmd_joint;
 mod mmd_physics;
 mod mmd_rigid_body;
+mod async_physics;
+pub use async_physics::AsyncPhysics;
 
 /// Z 轴翻转变换（左手 ↔ 右手坐标系转换，与 saba InvZ 一致）
 ///

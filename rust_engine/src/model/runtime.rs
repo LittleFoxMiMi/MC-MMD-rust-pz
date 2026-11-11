@@ -40,6 +40,42 @@ pub struct ModelVrDebugSnapshot {
     pub right_wrist_error_cm: f32,
 }
 
+struct WindowGeometrySource {
+    vertices: Vec<RuntimeVertex>,
+    weights: Vec<VertexWeight>,
+    morphs: Vec<Vec<(usize, Vec3)>>,
+}
+
+/// Owns every input to a secondary view. Evaluation never locks a live model.
+pub struct WindowGeometryFrame {
+    source: Arc<WindowGeometrySource>,
+    pub matrices: Vec<Mat4>,
+    effective: Vec<f32>,
+}
+
+impl WindowGeometryFrame {
+    pub fn vertex_count(&self) -> usize { self.source.vertices.len() }
+    pub fn evaluate(&self, output: &mut [f32]) -> bool {
+        let source = &self.source;
+        let count = source.vertices.len();
+        if output.len() != count * 6 { return false; }
+        let mut positions: Vec<Vec3> = source.vertices.iter().map(|v| v.position).collect();
+        for (offsets, &weight) in source.morphs.iter().zip(&self.effective) {
+            if weight == 0.0 { continue; }
+            for &(index, offset) in offsets {
+                if let Some(p) = positions.get_mut(index) { *p += offset * weight; }
+            }
+        }
+        let (pos, norm) = output.split_at_mut(count * 3);
+        pos.par_chunks_mut(3).zip(norm.par_chunks_mut(3)).enumerate().for_each(|(i,(p,n))| {
+            let (position, normal) = compute_vertex_skinning(positions[i], source.vertices[i].normal,
+                &source.weights[i], &self.matrices);
+            p.copy_from_slice(&position.to_array()); n.copy_from_slice(&normal.to_array());
+        });
+        true
+    }
+}
+
 /// 线程安全的伪随机数生成（0.0 - 1.0），使用 xorshift32
 fn rand_float() -> f32 {
     PRNG_STATE.with(|cell| {
@@ -126,6 +162,7 @@ pub struct MmdModel {
 
     // 物理系统
     physics: Option<MMDPhysics>,
+    async_physics: Option<crate::physics::AsyncPhysics>,
     physics_enabled: bool,
     /// 骨骼变换缓冲区（避免每帧堆分配）
     physics_bone_transforms_buf: Vec<Mat4>,
@@ -203,6 +240,7 @@ pub struct MmdModel {
     pz_hide_head: bool,
     pz_original_skinning: Vec<Mat4>,
     pz_camera_skinning: Vec<Mat4>,
+    window_geometry_source: Option<Arc<WindowGeometrySource>>,
     /// 头部骨骼索引缓存（模型加载后计算一次）
     head_bone_index: Option<usize>,
     /// 每个子网格是否属于头部（基于顶点位置自动检测）
@@ -297,6 +335,7 @@ impl MmdModel {
             model_transform: Mat4::IDENTITY,
             pz_weapon_transform: None,
             physics: None,
+            async_physics: None,
             physics_enabled: false,
             physics_bone_transforms_buf: Vec::new(),
             material_visible: Vec::new(),
@@ -346,6 +385,7 @@ impl MmdModel {
             pz_hide_head: false,
             pz_original_skinning: Vec::new(),
             pz_camera_skinning: Vec::new(),
+            window_geometry_source: None,
             head_bone_index: None,
             head_submesh_flags: Vec::new(),
             head_detection_initialized: false,
@@ -886,6 +926,20 @@ impl MmdModel {
                 n.copy_from_slice(&normal.to_array());
             });
         true
+    }
+
+    pub fn capture_window_geometry_frame(&mut self) -> WindowGeometryFrame {
+        let source = self.window_geometry_source.get_or_insert_with(|| {
+            let morphs = (0..self.morph_manager.morph_count()).map(|i| {
+                self.morph_manager.get_morph(i).filter(|m| m.morph_type == crate::morph::MorphType::Vertex)
+                    .map(|m| m.vertex_offsets.iter().map(|o| (o.vertex_index as usize, o.offset)).collect())
+                    .unwrap_or_default()
+            }).collect();
+            Arc::new(WindowGeometrySource { vertices: self.vertices.clone(), weights: self.weights.clone(), morphs })
+        }).clone();
+        let mut effective = vec![0.0; self.morph_manager.morph_count()];
+        self.morph_manager.compute_effective_weights_into(&mut effective);
+        WindowGeometryFrame { source, matrices: self.camera_skinning_matrices().to_vec(), effective }
     }
 
     /// Eye-tail anchor from the view-following pose before render-only head scaling.
@@ -2516,7 +2570,7 @@ impl MmdModel {
         }
 
         // 记录物理更新前的动态骨骼数量
-        let physics_enabled = self.physics_enabled && self.physics.is_some();
+        let physics_enabled = self.is_physics_enabled();
 
         self.update_physics(elapsed);
         self.update_node_animation(true);
@@ -2657,7 +2711,7 @@ impl MmdModel {
             runtime_state.process_post_ik(model, elapsed);
         });
 
-        let physics_enabled = !self.is_vrm && self.physics_enabled && self.physics.is_some();
+        let physics_enabled = !self.is_vrm && self.is_physics_enabled();
         if physics_enabled {
             let physics_started = profile.then(std::time::Instant::now);
             self.update_physics(elapsed);
@@ -2699,6 +2753,7 @@ impl MmdModel {
     }
 
     pub fn init_physics(&mut self) -> bool {
+        self.set_async_physics(false);
         if self.rigid_bodies.is_empty() {
             log::debug!("模型没有刚体数据，跳过物理初始化");
             return false;
@@ -2734,6 +2789,7 @@ impl MmdModel {
 
     /// 重置物理系统
     pub fn reset_physics(&mut self) {
+        if let Some(ref worker) = self.async_physics { worker.reset(); }
         if let Some(ref mut physics) = self.physics {
             physics.reset();
         }
@@ -2749,13 +2805,25 @@ impl MmdModel {
 
     /// 获取物理是否启用
     pub fn is_physics_enabled(&self) -> bool {
-        self.physics_enabled && self.physics.is_some()
+        self.physics_enabled && self.has_physics()
     }
 
     /// 获取物理系统是否已初始化
     pub fn has_physics(&self) -> bool {
-        self.physics.is_some()
+        self.physics.is_some() || self.async_physics.is_some()
     }
+
+    pub fn set_async_physics(&mut self, enabled: bool) {
+        let enabled = enabled && !self.is_vrm && self.pz_weapon_transform.is_none();
+        if enabled && self.async_physics.is_none() {
+            if let Some(physics) = self.physics.take() { self.async_physics = Some(crate::physics::AsyncPhysics::new(physics)); }
+        } else if !enabled {
+            if let Some(worker) = self.async_physics.take() {
+                let mut physics = worker.finish(); physics.reset(); self.physics = Some(physics);
+            }
+        }
+    }
+    pub fn async_physics_stats(&self) -> [i64;4] { self.async_physics.as_ref().map_or([0;4],|w| w.stats()) }
 
     /// 更新物理模拟（Bullet3）
     ///
@@ -2765,7 +2833,7 @@ impl MmdModel {
         let config = crate::physics::config::get_config();
 
         // 全局开关 + per-model 开关双重检查
-        if !config.enabled || !self.physics_enabled || self.physics.is_none() {
+        if !config.enabled || !self.physics_enabled || !self.has_physics() {
             self.reset_physics();
             return;
         }
@@ -2779,6 +2847,14 @@ impl MmdModel {
         }
 
         let model_transform = self.model_transform;
+
+        if let Some(ref worker) = self.async_physics {
+            if let Some(frame) = worker.submit(&self.physics_bone_transforms_buf,model_transform,delta_time,config) {
+                self.bone_manager.set_physics_bone_indices(&frame.indices);
+                self.bone_manager.apply_physics_transforms(&frame.transforms,&frame.rotation_only);
+            }
+            return;
+        }
 
         // 拆分借用：先取出 physics 避免同时借用 self
         let mut physics = self.physics.take().unwrap();
@@ -2823,6 +2899,12 @@ impl MmdModel {
     /// 获取物理调试信息（JSON 格式）
     pub fn get_physics_debug_info(&self) -> String {
         use crate::physics::PhysicsMode;
+
+        if let Some(ref worker) = self.async_physics {
+            let [submitted, completed, replaced, worker_ns] = worker.stats();
+            return format!("{{\"async\":true,\"stats\":{{\"total_rb\":{},\"joints\":{}}},\"submitted\":{},\"completed\":{},\"replaced\":{},\"worker_ns\":{}}}",
+                self.rigid_bodies.len(),self.joints.len(),submitted,completed,replaced,worker_ns);
+        }
 
         if let Some(ref physics) = self.physics {
             let mut info = String::from("{\n");
@@ -3482,6 +3564,13 @@ mod tests {
         assert_eq!(primary,model.update_positions_raw);assert_eq!(matrices,model.bone_manager.get_skinning_matrices());
         assert!(!model.copy_character_window_geometry(&mut [0.0;5]));
         let repeat=secondary.clone();assert!(model.copy_character_window_geometry(&mut secondary));assert_eq!(repeat,secondary);
+        let frozen=model.capture_window_geometry_frame();
+        assert_eq!(frozen.vertex_count(),1);assert!(!frozen.evaluate(&mut [0.0;5]));
+        let mut background=vec![0.0;6];assert!(frozen.evaluate(&mut background));assert_eq!(background,secondary);
+        model.morph_manager.get_morph_mut(0).unwrap().weight=0.0;
+        model.set_first_person_presentation(false,false);model.update();drop(model);
+        let result=std::thread::spawn(move||{let mut result=vec![0.0;6];assert!(frozen.evaluate(&mut result));result}).join().unwrap();
+        assert_eq!(result,secondary);
     }
 
     fn make_neck_head_test_model(neck_name: &str, head_parent: i32) -> MmdModel {

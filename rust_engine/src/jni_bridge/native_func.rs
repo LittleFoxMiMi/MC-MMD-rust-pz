@@ -20,6 +20,64 @@ const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;
 
+static WINDOW_FRAMES: once_cell::sync::Lazy<std::sync::RwLock<std::collections::HashMap<i64, Arc<crate::model::WindowGeometryFrame>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAsyncPhysics(
+    _env: JNIEnv, _class: JClass, handle: jlong, enabled: jboolean,
+) -> jboolean {
+    let Some(model) = MODELS.read().unwrap().get(&handle).cloned() else { return 0; };
+    model.lock().unwrap().set_async_physics(enabled != 0); 1
+}
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetPZAsyncPhysicsStats(
+    env: JNIEnv, _class: JClass, handle: jlong, values: JLongArray,
+) {
+    if env.get_array_length(&values).unwrap_or(0) < 4 { return; }
+    let Some(model) = MODELS.read().unwrap().get(&handle).cloned() else { return; };
+    let stats = model.lock().unwrap().async_physics_stats(); let _ = env.set_long_array_region(&values,0,&stats);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_CaptureCharacterWindowFrame(
+    env: JNIEnv, _class: JClass, model: jlong, palette: JByteBuffer, uvs: JByteBuffer,
+) -> jlong {
+    let Some(owner) = MODELS.read().unwrap().get(&model).cloned() else { return 0; };
+    let mut owner = owner.lock().unwrap();
+    let size = owner.bone_manager.bone_count() * 64;
+    let Ok(dst) = env.get_direct_buffer_address(&palette) else { return 0; };
+    if env.get_direct_buffer_capacity(&palette).unwrap_or(0) < size { return 0; }
+    let Ok(uv_dst) = env.get_direct_buffer_address(&uvs) else { return 0; };
+    let uv_bytes = owner.update_uvs_raw.len() * 4;
+    if env.get_direct_buffer_capacity(&uvs).unwrap_or(0) < uv_bytes { return 0; }
+    let frame = owner.capture_window_geometry_frame();
+    unsafe { ptr::copy_nonoverlapping(frame.matrices.as_ptr() as *const u8, dst, size); }
+    unsafe { ptr::copy_nonoverlapping(owner.update_uvs_raw.as_ptr() as *const u8, uv_dst, uv_bytes); }
+    drop(owner);
+    let id = super::next_handle_id();
+    WINDOW_FRAMES.write().unwrap().insert(id, Arc::new(frame)); id
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_EvaluateCharacterWindowFrame(
+    env: JNIEnv, _class: JClass, frame: jlong, buffer: JByteBuffer,
+) -> jint {
+    // Drop the registry lock before the expensive work; delete/model updates never wait for skinning.
+    let Some(frame) = WINDOW_FRAMES.read().unwrap().get(&frame).cloned() else { return 0; };
+    let count = frame.vertex_count();
+    let Some(bytes) = count.checked_mul(24) else { return 0; };
+    let Ok(dst) = env.get_direct_buffer_address(&buffer) else { return 0; };
+    if env.get_direct_buffer_capacity(&buffer).unwrap_or(0) < bytes || dst.align_offset(4) != 0 { return 0; }
+    let result = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, count * 6) };
+    if frame.evaluate(result) { count as jint } else { 0 }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ReleaseCharacterWindowFrame(
+    _env: JNIEnv, _class: JClass, frame: jlong,
+) { WINDOW_FRAMES.write().unwrap().remove(&frame); }
+
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZWeaponTransform(
     env: JNIEnv, _class: JClass, handle: jlong, values: JFloatArray,
