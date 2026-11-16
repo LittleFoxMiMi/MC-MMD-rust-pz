@@ -79,6 +79,32 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ReleaseCharacterWindo
 ) { WINDOW_FRAMES.write().unwrap().remove(&frame); }
 
 #[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_EvaluatePZLateArms(
+    env: JNIEnv,_class:JClass,previous:jlong,frame:jlong,alpha:jfloat,
+    indices:JByteBuffer,palette:JByteBuffer,geometry:JByteBuffer,
+) -> jint {
+    let (a,b)={let frames=WINDOW_FRAMES.read().unwrap();
+        let Some(a)=frames.get(&previous).cloned() else{return 0;};
+        let Some(b)=frames.get(&frame).cloned() else{return 0;};(a,b)};
+    let Ok(ids)=env.get_direct_buffer_address(&indices) else{return 0;};
+    let count=env.get_direct_buffer_capacity(&indices).unwrap_or(0)/4;
+    let Ok(p)=env.get_direct_buffer_address(&palette) else{return 0;};
+    let Ok(out)=env.get_direct_buffer_address(&geometry) else{return 0;};
+    if ids.align_offset(4)!=0||p.align_offset(4)!=0||out.align_offset(4)!=0||!alpha.is_finite()
+        ||env.get_direct_buffer_capacity(&palette).unwrap_or(0)<b.matrices.len()*64
+        ||env.get_direct_buffer_capacity(&geometry).unwrap_or(0)<count*24{return 0;}
+    let ids=unsafe{std::slice::from_raw_parts(ids as *const i32,count)};
+    let values=unsafe{std::slice::from_raw_parts(p as *const f32,b.matrices.len()*16)};
+    let mut matrices=Vec::with_capacity(b.matrices.len());
+    for v in values.chunks_exact(16){let mut v:[f32;16]=v.try_into().unwrap();
+        for col in 0..4{for row in 0..4{if (col==0)!=(row==0){v[col*4+row]=-v[col*4+row];}}}
+        if v.iter().any(|x|!x.is_finite()){return 0;}
+        matrices.push(glam::Mat4::from_cols_array(&v));}
+    let output=unsafe{std::slice::from_raw_parts_mut(out as *mut f32,count*6)};
+    if b.evaluate_late_arms(&a,alpha.clamp(0.0,1.0),ids,&matrices,output){count as jint}else{0}
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZWeaponTransform(
     env: JNIEnv, _class: JClass, handle: jlong, values: JFloatArray,
 ) -> jboolean {
@@ -134,6 +160,29 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZLegIKSuppressed(
     if let Some(model) = models.get(&model) {
         model.lock().unwrap().pz_suppress_leg_ik = suppressed != 0;
     }
+}
+
+/// Frame-local IK and sparse facial Morph overrides; model zero probes ABI support.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZPlaybackOptions(
+    env: JNIEnv, _class: JClass, model: jlong, ik: jboolean, indices: JIntArray, weights: JFloatArray,
+) -> jboolean {
+    let count = env.get_array_length(&indices).unwrap_or(0) as usize;
+    if count > 100000 || env.get_array_length(&weights).unwrap_or(-1) != count as i32 { return 0; }
+    let mut i = vec![0; count]; let mut w = vec![0.0; count];
+    if env.get_int_array_region(&indices, 0, &mut i).is_err()
+        || env.get_float_array_region(&weights, 0, &mut w).is_err() { return 0; }
+    let models = MODELS.read().unwrap();
+    if let Some(model) = models.get(&model) {
+        let mut model = model.lock().unwrap();
+        model.pz_playback_ik = ik != 0;
+        let size = model.morph_manager.morph_count();
+        model.pz_expression_morphs = i.iter().zip(w.iter()).filter_map(|(&index, &weight)| {
+            if index < 0 || index as usize >= size || !weight.is_finite() { None }
+            else { Some((index as usize, weight)) }
+        }).collect();
+    }
+    1
 }
 
 /// Optional per-submission policy; legacy callers retain replacement Morph clearing.
@@ -202,6 +251,8 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAnimationState(
         model.pz_vmd_layers = layers;
         // Legacy callers and the next scene always start with the original policy.
         model.pz_preserve_manual_morphs = false;
+        model.pz_playback_ik = true;
+        model.pz_expression_morphs.clear();
         let count = model.morph_manager.morph_count();
         model.pz_manual_morphs = i.iter().zip(w.iter()).filter_map(|(&index, &weight)| {
             if index < 0 || index as usize >= count || !weight.is_finite() { None }

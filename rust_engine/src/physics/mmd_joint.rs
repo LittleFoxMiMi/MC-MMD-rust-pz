@@ -59,6 +59,9 @@ impl MmdJointData {
 
         // 配置约束参数（仅在创建成功时）
         if let Some(ref c) = constraint {
+            // RGBA compatibility trial: use the legacy 6DOF frame behavior.
+            // Newer Bullet frame offsets strongly suppress this constraint network's motion.
+            c.use_frame_offset(false);
             for axis in 0..6 {
                 c.set_param(BT_CONSTRAINT_STOP_ERP, 0.475, axis);
             }

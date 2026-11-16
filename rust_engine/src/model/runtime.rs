@@ -54,6 +54,31 @@ pub struct WindowGeometryFrame {
 }
 
 impl WindowGeometryFrame {
+    /// Small render-time subset; preserve native BDEF/SDEF/QDEF and vertex morphs.
+    /// Inputs are immutable, so this never waits on the worker's model mutex.
+    pub fn evaluate_late_arms(&self, previous: &Self, alpha: f32, indices: &[i32],
+        matrices: &[Mat4], output: &mut [f32]) -> bool {
+        if output.len()!=indices.len()*6 || matrices.len()!=self.matrices.len()
+            || !Arc::ptr_eq(&self.source,&previous.source) || indices.windows(2).any(|p|p[0]>=p[1])
+            || indices.iter().any(|&i|i<0||i as usize>=self.vertex_count()) {return false;}
+        let mut positions:Vec<Vec3>=indices.iter().map(|&i|self.source.vertices[i as usize].position).collect();
+        for (morph,offsets) in self.source.morphs.iter().enumerate(){
+            let a=previous.effective.get(morph).copied().unwrap_or(0.0);
+            let b=self.effective.get(morph).copied().unwrap_or(0.0);
+            let weight=a+(b-a)*alpha;
+            if weight==0.0 {continue;}
+            for &(index,offset) in offsets {
+                if let Ok(slot)=indices.binary_search(&(index as i32)){positions[slot]+=offset*weight;}
+            }
+        }
+        for (slot,&index) in indices.iter().enumerate(){
+            let vertex=&self.source.vertices[index as usize];
+            let (p,n)=compute_vertex_skinning(positions[slot],vertex.normal,&self.source.weights[index as usize],matrices);
+            // Java render space reflects X. Interleaved vec3 position + normal.
+            output[slot*6..slot*6+6].copy_from_slice(&[-p.x,p.y,p.z,-n.x,n.y,n.z]);
+        }
+        true
+    }
     pub fn vertex_count(&self) -> usize { self.source.vertices.len() }
     pub fn evaluate(&self, output: &mut [f32]) -> bool {
         let source = &self.source;
@@ -228,6 +253,8 @@ pub struct MmdModel {
     pub pz_manual_morphs: Vec<(usize, f32)>,
     /// Explicit menu/wheel playback keeps the user's Morph baseline on replacement.
     pub pz_preserve_manual_morphs: bool,
+    pub pz_playback_ik: bool,
+    pub pz_expression_morphs: Vec<(usize, f32)>,
     /// Opt-in PZ placement policy; upstream and calibration retain normal Morphs.
     pz_root_morph_root: Option<usize>,
     pub pz_root_morph_height: f32,
@@ -365,6 +392,8 @@ impl MmdModel {
             pz_action_turns: Vec::new(),
             pz_manual_morphs: Vec::new(),
             pz_preserve_manual_morphs: false,
+            pz_playback_ik: true,
+            pz_expression_morphs: Vec::new(),
             pz_root_morph_root: None,
             pz_root_morph_height: 0.0,
             vr_hand_mode: 0,
@@ -2679,6 +2708,12 @@ impl MmdModel {
                 self.bone_manager.set_ik_enabled_by_name(name, false);
             }
         }
+        for &(index, weight) in &self.pz_expression_morphs {
+            self.morph_manager.set_morph_weight(index, weight);
+        }
+        if !self.pz_playback_ik {
+            self.bone_manager.disable_all_ik();
+        }
         self.update_morph_animation();
 
         if !cpu_skinning {
@@ -3571,6 +3606,34 @@ mod tests {
         model.set_first_person_presentation(false,false);model.update();drop(model);
         let result=std::thread::spawn(move||{let mut result=vec![0.0;6];assert!(frozen.evaluate(&mut result));result}).join().unwrap();
         assert_eq!(result,secondary);
+    }
+
+    #[test]
+    fn late_arm_subset_uses_current_palette_and_interpolated_morphs_without_live_model() {
+        let weights=vec![VertexWeight::Bdef1{bone:0},
+            VertexWeight::Bdef2{bones:[0,1],weight:0.35},
+            VertexWeight::Bdef4{bones:[0,1,0,1],weights:[0.1,0.2,0.3,0.4]},
+            VertexWeight::Sdef{bones:[0,1],weight:0.4,c:Vec3::new(0.1,0.2,0.3),r0:Vec3::X,r1:Vec3::Y},
+            VertexWeight::Qdef{bones:[0,1,0,1],weights:[0.1,0.2,0.3,0.4]}];
+        let source=Arc::new(WindowGeometrySource{
+            vertices:(0..5).map(|i|RuntimeVertex{position:Vec3::new(i as f32,1.0,0.2),normal:Vec3::Y,uv:Vec2::ZERO}).collect(),
+            weights,morphs:vec![vec![(1,Vec3::X),(3,Vec3::Z),(4,Vec3::Y)]]});
+        let a=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.2]};
+        let b=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.8]};
+        let live=vec![Mat4::from_rotation_translation(Quat::from_rotation_z(0.8),Vec3::X),
+            Mat4::from_rotation_translation(Quat::from_rotation_y(-0.5),Vec3::Z)];
+        let ids=[0,1,3,4];let mut result=[0.0;24];
+        assert!(b.evaluate_late_arms(&a,0.25,&ids,&live,&mut result));
+        for (slot,&id) in ids.iter().enumerate(){
+            let mut position=source.vertices[id as usize].position;
+            for &(index,offset) in &source.morphs[0]{if index==id as usize{position+=offset*0.35;}}
+            let (p,n)=compute_vertex_skinning(position,Vec3::Y,&source.weights[id as usize],&live);
+            assert!(Vec3::from_slice(&result[slot*6..]).abs_diff_eq(Vec3::new(-p.x,p.y,p.z),1e-6));
+            assert!(Vec3::from_slice(&result[slot*6+3..]).abs_diff_eq(Vec3::new(-n.x,n.y,n.z),1e-6));
+        }
+        assert!(!b.evaluate_late_arms(&a,0.25,&[1,0,3,4],&live,&mut result));
+        assert!(!b.evaluate_late_arms(&a,0.25,&[0,1,3,7],&live,&mut result));
+        assert_eq!(b.matrices,vec![Mat4::IDENTITY;2]);
     }
 
     fn make_neck_head_test_model(neck_name: &str, head_parent: i32) -> MmdModel {

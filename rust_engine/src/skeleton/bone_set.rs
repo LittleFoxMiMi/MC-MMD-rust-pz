@@ -316,6 +316,10 @@ impl BoneSet {
     }
 
     /// 重置所有 IK 求解器为启用状态
+    pub fn disable_all_ik(&mut self) {
+        for solver in &mut self.ik_solvers { solver.enabled = false; }
+    }
+
     pub fn reset_all_ik_enabled(&mut self) {
         for solver in &mut self.ik_solvers {
             solver.enabled = true;
