@@ -12,7 +12,7 @@ use mmd::pmx::rigid_body::RigidBody as PmxRigidBody;
 
 use super::bullet_ffi::{self, BulletWorld};
 use super::config::{get_config, PhysicsConfig};
-use super::mmd_joint::MmdJointData;
+use super::mmd_joint::{legacy_frame_joints, MmdJointData};
 use super::mmd_rigid_body::{MmdRigidBodyData, PhysicsMode};
 
 /// MMD 物理世界管理器（Bullet3 引擎）
@@ -132,8 +132,10 @@ impl MMDPhysics {
         // 第三步：创建关节并存入 Vec
         if config.joints_enabled {
             self.joints.reserve(pmx_joints.len());
+            let legacy_joints = legacy_frame_joints(pmx_rigid_bodies, pmx_joints);
+            log::info!("[Bullet3] RGBA legacy frame joints: {}/{}", legacy_joints.len(), pmx_joints.len());
 
-            for pmx_joint in pmx_joints {
+            for (joint_index, pmx_joint) in pmx_joints.iter().enumerate() {
                 let rb_a_idx = pmx_joint.rigid_body_a_index as usize;
                 let rb_b_idx = pmx_joint.rigid_body_b_index as usize;
 
@@ -157,6 +159,11 @@ impl MMDPhysics {
 
                 let joint_data =
                     MmdJointData::from_pmx(pmx_joint, rb_a_body, rb_b_body, rb_a_init, rb_b_init);
+                if legacy_joints.contains(&joint_index) {
+                    if let Some(ref constraint) = joint_data.constraint {
+                        constraint.use_frame_offset(false);
+                    }
+                }
 
                 // 先存入 Vec，再添加到世界
                 self.joints.push(joint_data);

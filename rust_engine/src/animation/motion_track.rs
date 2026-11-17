@@ -737,9 +737,7 @@ impl CameraMotionTrack {
         let f0 = self.seek_raw(frame_index, bezier_factory);
 
         if amount > 0.0 {
-            // Adjacent authored camera keys describe a cut, not a 1/30 s flight.
-            if self.keyframes.contains_key(&frame_index)
-                && self.keyframes.contains_key(&frame_index.saturating_add(1)) {
+            if self.is_cut_after(frame_index) {
                 return Self::compute_camera_transform(f0.look_at, f0.angle, f0.distance, f0.fov, f0.is_perspective);
             }
             let f1 = self.seek_raw(frame_index.saturating_add(1), bezier_factory);
@@ -771,6 +769,25 @@ impl CameraMotionTrack {
                 f0.is_perspective,
             )
         }
+    }
+
+    /// Isolated adjacent keys encode a cut; a contiguous baked sequence usually
+    /// encodes motion. In dense tracks retain lens-mode switches and jumps that
+    /// dwarf BOTH neighboring steps. Keep this policy in sync with VmdAsset.
+    fn is_cut_after(&self, frame: u32) -> bool {
+        let Some(a) = self.keyframes.get(&frame) else { return false; };
+        let Some(b) = frame.checked_add(1).and_then(|f| self.keyframes.get(&f)) else { return false; };
+        let before = frame.checked_sub(1).and_then(|f| self.keyframes.get(&f));
+        let after = frame.checked_add(2).and_then(|f| self.keyframes.get(&f));
+        if before.is_none() && after.is_none() || a.is_perspective != b.is_perspective { return true; }
+        let values = |k: &CameraKeyframe| [k.look_at.x,k.look_at.y,k.look_at.z,
+            k.angle.x,k.angle.y,k.angle.z,k.distance,k.fov];
+        let av=values(a);let bv=values(b);
+        let pv=before.map(values).unwrap_or(av);let nv=after.map(values).unwrap_or(bv);
+        let floors=[1.0,1.0,1.0,std::f32::consts::PI/18.0,std::f32::consts::PI/18.0,
+            std::f32::consts::PI/18.0,1.0,5.0];
+        (0..8).any(|i| {let delta=(bv[i]-av[i]).abs();
+            delta>floors[i] && delta>8.0*(av[i]-pv[i]).abs().max((nv[i]-bv[i]).abs())})
     }
 
     /// 在两个关键帧之间插值原始参数（使用贝塞尔曲线）
@@ -856,5 +873,24 @@ mod camera_playback_tests {
         let start=track.seek(10,&curves);
         assert!(track.seek_precisely(10,0.99,&curves).position.abs_diff_eq(start.position,1e-5));
         assert!(track.seek(11,&curves).position.distance(start.position)>100.0);
+    }
+    #[test]
+    fn baked_camera_interpolates_but_dense_jump_and_projection_change_cut() {
+        let curves=BezierCurveCache::new();
+        let mut track=CameraMotionTrack::new();
+        for f in 0..6 { track.insert_keyframe(CameraKeyframe{frame_index:f,
+            look_at:Vec3::new(f as f32,0.0,0.0),..Default::default()}); }
+        for f in 0..5 {
+            let a=track.seek(f,&curves);let b=track.seek(f+1,&curves);
+            assert!(!track.is_cut_after(f));
+            assert!(track.seek_precisely(f,0.5,&curves).position.abs_diff_eq(a.position.lerp(b.position,0.5),1e-5));
+        }
+        for f in 3..6 { track.keyframes.get_mut(&f).unwrap().look_at.x+=100.0; }
+        assert!(track.is_cut_after(2));
+        assert!(track.seek_precisely(2,0.99,&curves).position.abs_diff_eq(track.seek(2,&curves).position,1e-5));
+        assert!(!track.is_cut_after(1));assert!(!track.is_cut_after(3));
+        track.keyframes.get_mut(&5).unwrap().is_perspective=false;
+        assert!(track.is_cut_after(4));
+        assert!(!track.is_cut_after(u32::MAX));
     }
 }
