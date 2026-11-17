@@ -24,6 +24,23 @@ static WINDOW_FRAMES: once_cell::sync::Lazy<std::sync::RwLock<std::collections::
     once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 #[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZVehicleMotion(
+    env: JNIEnv, _class: JClass, handle: jlong, values: JFloatArray,
+) -> jboolean {
+    let Some(model) = MODELS.read().unwrap().get(&handle).cloned() else { return 0; };
+    let motion = if values.is_null() { None } else {
+        let mut v = [0.0f32;12];
+        if env.get_array_length(&values).unwrap_or(0)!=12
+            || env.get_float_array_region(&values,0,&mut v).is_err()
+            || v.iter().any(|f| !f.is_finite()) { return 0; }
+        let map = glam::Mat3::from_cols_array(v[3..].try_into().unwrap());
+        if map.determinant().abs()<1e-8 { return 0; }
+        Some(crate::physics::VehicleMotion { velocity:glam::Vec3::new(v[0],v[1],v[2]),world_to_local:map })
+    };
+    model.lock().unwrap().set_pz_vehicle_motion(motion);1
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetPZAsyncPhysics(
     _env: JNIEnv, _class: JClass, handle: jlong, enabled: jboolean,
 ) -> jboolean {

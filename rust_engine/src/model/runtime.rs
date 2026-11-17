@@ -183,6 +183,7 @@ pub struct MmdModel {
 
     // 模型全局变换
     model_transform: Mat4,
+    pz_vehicle_motion: Option<crate::physics::VehicleMotion>,
     pz_weapon_transform: Option<Mat4>,
 
     // 物理系统
@@ -360,6 +361,7 @@ impl MmdModel {
             is_vrm: false,
             vrm_runtime_state: None,
             model_transform: Mat4::IDENTITY,
+            pz_vehicle_motion: None,
             pz_weapon_transform: None,
             physics: None,
             async_physics: None,
@@ -1877,6 +1879,10 @@ impl MmdModel {
         self.model_transform = transform;
     }
 
+    pub fn set_pz_vehicle_motion(&mut self, motion: Option<crate::physics::VehicleMotion>) {
+        self.pz_vehicle_motion = motion;
+    }
+
     pub fn set_pz_weapon_transform(&mut self, transform: Mat4) {
         self.pz_weapon_transform = Some(transform);
     }
@@ -2884,7 +2890,7 @@ impl MmdModel {
         let model_transform = self.model_transform;
 
         if let Some(ref worker) = self.async_physics {
-            if let Some(frame) = worker.submit(&self.physics_bone_transforms_buf,model_transform,delta_time,config) {
+            if let Some(frame) = worker.submit_with_vehicle_motion(&self.physics_bone_transforms_buf,model_transform,delta_time,config,self.pz_vehicle_motion) {
                 self.bone_manager.set_physics_bone_indices(&frame.indices);
                 self.bone_manager.apply_physics_transforms(&frame.transforms,&frame.rotation_only);
             }
@@ -2908,12 +2914,14 @@ impl MmdModel {
         }
 
         // 1. 同步运动学刚体
-        physics.sync_bodies_with_model_velocity(
+        if let Some(motion) = self.pz_vehicle_motion {
+            physics.sync_bodies_with_vehicle_velocity(&self.physics_bone_transforms_buf,delta_time,motion,&config);
+        } else { physics.sync_bodies_with_model_velocity(
             &self.physics_bone_transforms_buf,
             delta_time,
             model_transform,
             &config,
-        );
+        ); }
 
         // 2. Bullet3 步进（传入 config 避免内部重复 get_config）
         physics.step_simulation(delta_time, &config);

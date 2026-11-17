@@ -10,7 +10,7 @@ pub struct PhysicsFrame {
     pub rotation_only: HashSet<usize>,
     pub indices: HashSet<usize>,
 }
-struct Job { bones: Vec<Mat4>, transform: Mat4, delta: f32, config: PhysicsConfig, epoch: u64 }
+struct Job { bones: Vec<Mat4>, transform: Mat4, delta: f32, config: PhysicsConfig, epoch: u64, motion: Option<super::VehicleMotion> }
 #[derive(Default)]
 struct Mailbox {
     pending: Option<Job>, latest: Option<Arc<PhysicsFrame>>, stop: bool, epoch: u64,
@@ -42,7 +42,9 @@ impl AsyncPhysics {
                 };
                 if epoch != job.epoch { physics.reset(); epoch = job.epoch; }
                 let start = std::time::Instant::now();
-                physics.sync_bodies_with_model_velocity(&job.bones, job.delta, job.transform, &job.config);
+                if let Some(motion) = job.motion {
+                    physics.sync_bodies_with_vehicle_velocity(&job.bones,job.delta,motion,&job.config);
+                } else { physics.sync_bodies_with_model_velocity(&job.bones, job.delta, job.transform, &job.config); }
                 physics.step_simulation(job.delta, &job.config);
                 let indices = physics.get_dynamic_bone_indices().clone();
                 let (transforms, rotation_only) = physics.get_dynamic_bone_transforms(job.bones.len());
@@ -56,12 +58,15 @@ impl AsyncPhysics {
         Self { shared, worker: Some(worker) }
     }
     pub fn submit(&self, bones: &[Mat4], transform: Mat4, delta: f32, config: PhysicsConfig) -> Option<Arc<PhysicsFrame>> {
+        self.submit_with_vehicle_motion(bones,transform,delta,config,None)
+    }
+    pub fn submit_with_vehicle_motion(&self, bones: &[Mat4], transform: Mat4, delta: f32, config: PhysicsConfig, motion: Option<super::VehicleMotion>) -> Option<Arc<PhysicsFrame>> {
         let mut state = self.shared.0.lock().unwrap();
         let mut delta = if delta.is_finite() { delta.max(0.0) } else { 0.0 };
         if let Some(previous) = state.pending.take() { delta += previous.delta; state.replaced += 1; }
         // Match PZ's bounded catch-up after a stall. Replaced snapshots keep elapsed time.
         let epoch = state.epoch;
-        state.pending = Some(Job { bones: bones.to_vec(), transform, delta: delta.clamp(0.0,0.1), config, epoch });
+        state.pending = Some(Job { bones: bones.to_vec(), transform, delta: delta.clamp(0.0,0.1), config, epoch, motion });
         state.submitted += 1;
         let frame = state.latest.clone();
         drop(state); self.shared.1.notify_one(); frame
@@ -112,6 +117,7 @@ mod tests {
     }
     #[test]
     fn worker_matches_synchronous_bullet_for_identical_inputs() {
+        for vehicle in [false,true] {
         for mode in [RigidBodyMode::Dynamic,RigidBodyMode::DynamicWithBonePosition] {
             let mut reference=physics(mode);let worker=AsyncPhysics::new(physics(mode));
             let config=PhysicsConfig::default();
@@ -120,8 +126,15 @@ mod tests {
                 let bones=[Mat4::from_rotation_translation(Quat::from_rotation_y(t),Vec3::new(t.sin(),0.0,0.0))];
                 let root=Mat4::from_translation(Vec3::new(t*2.0,0.0,0.0));
                 let delta=if i%17==0 {0.0} else {1.0/120.0};
-                reference.sync_bodies_with_model_velocity(&bones,delta,root,&config);reference.step_simulation(delta,&config);
-                worker.submit(&bones,root,delta,config.clone());let actual=wait(&worker,i+1);
+                let motion=super::super::VehicleMotion {velocity:Vec3::new(t.sin()*25.0,0.0,t.cos()*25.0),world_to_local:glam::Mat3::from_rotation_y(t)*10.0};
+                if vehicle {
+                    reference.sync_bodies_with_vehicle_velocity(&bones,delta,motion,&config);
+                    worker.submit_with_vehicle_motion(&bones,root,delta,config.clone(),Some(motion));
+                } else {
+                    reference.sync_bodies_with_model_velocity(&bones,delta,root,&config);
+                    worker.submit(&bones,root,delta,config.clone());
+                }
+                reference.step_simulation(delta,&config);let actual=wait(&worker,i+1);
                 let indices=reference.get_dynamic_bone_indices().clone();
                 let (expected,rotation_only)=reference.get_dynamic_bone_transforms(1);
                 assert_eq!(actual.indices,indices);assert_eq!(&actual.rotation_only,rotation_only);
@@ -132,6 +145,7 @@ mod tests {
                 }
             }
             let recovered=worker.finish();assert_eq!(recovered.rigid_bodies.len(),1);
+        }
         }
     }
     #[test]

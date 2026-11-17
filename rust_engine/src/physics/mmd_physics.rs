@@ -15,6 +15,14 @@ use super::config::{get_config, PhysicsConfig};
 use super::mmd_joint::{legacy_frame_joints, MmdJointData};
 use super::mmd_rigid_body::{MmdRigidBodyData, PhysicsMode};
 
+/// Captured host physics velocity in scene units and its map into local Bullet
+/// units. Never infer vehicle acceleration from interpolated display positions.
+#[derive(Clone, Copy, Debug)]
+pub struct VehicleMotion {
+    pub velocity: Vec3,
+    pub world_to_local: Mat3,
+}
+
 /// MMD 物理世界管理器（Bullet3 引擎）
 ///
 /// 移植自 babylon-mmd，管理 Bullet3 世界、刚体、关节。
@@ -42,6 +50,7 @@ pub struct MMDPhysics {
     /// 上一帧模型世界位置（用于计算移动速度实现惯性）
     prev_model_position: Option<Vec3>,
     prev_model_velocity: Vec3,
+    prev_vehicle_velocity: Option<Vec3>,
     prev_weapon_frame: Option<Mat4>,
     weapon_bone_buf: Vec<Mat4>,
     /// 等待下一帧完成动画/IK后，按当前姿态初始化动态体。
@@ -73,6 +82,7 @@ impl MMDPhysics {
             dynamic_bone_buf: Vec::new(),
             prev_model_position: None,
             prev_model_velocity: Vec3::ZERO,
+            prev_vehicle_velocity: None,
             prev_weapon_frame: None,
             weapon_bone_buf: Vec::new(),
             needs_initialize: true,
@@ -254,6 +264,7 @@ impl MMDPhysics {
         model_transform: Mat4,
         config: &PhysicsConfig,
     ) {
+        self.prev_vehicle_velocity = None;
         if self.needs_initialize {
             self.initialize(bone_transforms);
         }
@@ -294,6 +305,30 @@ impl MMDPhysics {
                 if mass > 0.0 {
                     body.apply_central_impulse(response * mass);
                 }
+            }
+        }
+    }
+
+    pub fn sync_bodies_with_vehicle_velocity(
+        &mut self, bones: &[Mat4], delta: f32, motion: VehicleMotion, config: &PhysicsConfig,
+    ) {
+        if self.needs_initialize { self.initialize(bones); }
+        self.sync_bodies(bones);
+        self.prev_model_position = None;
+        self.prev_model_velocity = Vec3::ZERO;
+        let previous = self.prev_vehicle_velocity.replace(motion.velocity);
+        if !delta.is_finite() || delta <= 0.0 { return; }
+        let Some(previous) = previous else { return; };
+        // Difference in WORLD space first: rotating a constant local forward
+        // velocity through a turn must still produce lateral acceleration.
+        let response = -(motion.world_to_local * (motion.velocity - previous)) * config.inertia_strength.max(0.0);
+        if !response.is_finite() { self.prev_vehicle_velocity = None; return; }
+        let response = response.clamp_length_max(config.max_linear_velocity);
+        for rb in &self.rigid_bodies {
+            if rb.physics_mode == PhysicsMode::FollowBone { continue; }
+            if let Some(body) = &rb.bullet_body {
+                let mass = body.get_mass();
+                if mass > 0.0 { body.apply_central_impulse(response * mass); }
             }
         }
     }
@@ -429,6 +464,7 @@ impl MMDPhysics {
     ///
     /// 在骨骼初始姿态确定后调用，将所有刚体设置到正确的初始位置（左手空间）。
     pub fn initialize(&mut self, bone_transforms: &[Mat4]) {
+        self.prev_vehicle_velocity = None;
         self.needs_initialize = false;
         self.prev_model_position = None;
         self.prev_model_velocity = Vec3::ZERO;
@@ -448,6 +484,7 @@ impl MMDPhysics {
 
     /// 重置物理系统
     pub fn reset(&mut self) {
+        self.prev_vehicle_velocity = None;
         self.prev_model_position = None;
         self.prev_model_velocity = Vec3::ZERO;
         self.prev_weapon_frame = None;

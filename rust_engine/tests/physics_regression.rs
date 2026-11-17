@@ -180,6 +180,54 @@ fn movement_inertia_responds_to_acceleration_and_stop_at_any_frame_rate() {
 }
 
 #[test]
+fn vehicle_inertia_uses_world_velocity_and_seat_units_without_speed_rejection() {
+    use mmd::pmx::rigid_body::{RigidBody, RigidBodyMode, RigidBodyShape};
+    use mmd_engine::physics::{MMDPhysics, PhysicsConfig, VehicleMotion};
+    let rigid = RigidBody {
+        local_name: "vehicle inertia".into(), universal_name:String::new(),bone_index:0,
+        group:0,un_collision_group_flag:0,shape:RigidBodyShape::Sphere,size:[0.5,0.0,0.0],
+        position:[0.0;3],rotation:[0.0;3],mass:1.0,move_attenuation:0.0,rotation_attenuation:0.0,
+        repulsion:0.0,friction:0.0,mode:RigidBodyMode::Dynamic,
+    };
+    let config=PhysicsConfig { gravity_y:0.0,inertia_strength:1.0,..PhysicsConfig::default() };
+    for fps in [30,60,120] {
+        let mut physics=MMDPhysics::new().unwrap();
+        physics.build_physics(&[rigid.clone()],&[],&[Mat4::IDENTITY]);physics.set_gravity(0.0,0.0,0.0);
+        let dt=1.0/fps as f32;
+        let map=glam::Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2)*10.0;
+        let sample=|v|VehicleMotion {velocity:v,world_to_local:map};
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],0.0,sample(Vec3::X*25.0),&config);
+        for tick in 1..=fps {
+            let v=Vec3::X*(25.0+tick as f32/fps as f32);
+            physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(v),&config);
+            physics.step_simulation(dt,&config);
+        }
+        let velocity=||physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity();
+        assert!((velocity()+map*Vec3::X).length()<0.001,"vehicle acceleration at {fps}: {:?}",velocity());
+        for _ in 0..fps {
+            physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(Vec3::X*26.0),&config);
+            physics.step_simulation(dt,&config);
+        }
+        let v=physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity();
+        assert!((v+map*Vec3::X).length()<0.001,"constant-speed drag: {v}");
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(Vec3::X*25.0),&config);
+        physics.step_simulation(dt,&config);
+        assert!(physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity().length()<0.001,"braking direction");
+        // A world direction change at the same speed produces lateral inertia.
+        let turned=Vec3::new(24.98,0.0,1.0);
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(turned),&config);
+        let expected=-(map*(turned-Vec3::X*25.0));
+        assert!((physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity()-expected).length()<0.001,"turn direction");
+        physics.reset();
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(Vec3::X*80.0),&config);
+        assert!(physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity().length()<0.001,"boarding/reset kick");
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],0.0,sample(Vec3::ZERO),&config);
+        physics.sync_bodies_with_vehicle_velocity(&[Mat4::IDENTITY],dt,sample(Vec3::ZERO),&config);
+        assert!(physics.rigid_bodies[0].bullet_body.as_ref().unwrap().get_linear_velocity().length()<0.001,"zero-time rebase kick");
+    }
+}
+
+#[test]
 fn weapon_kinematic_velocity_and_dynamic_travel_follow_render_time() {
     use mmd::pmx::rigid_body::{RigidBody, RigidBodyMode, RigidBodyShape};
     use mmd_engine::physics::{MMDPhysics, PhysicsConfig};
