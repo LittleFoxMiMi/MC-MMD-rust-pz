@@ -12,6 +12,7 @@ mod vrm_material;
 mod vrm_mesh;
 mod vrm_morph;
 mod vrm_skeleton;
+mod vrm_vmd;
 
 pub use loader::load_pmx;
 pub use material::MmdMaterial;
@@ -26,6 +27,8 @@ pub use vrm_extensions::{
 };
 pub use vrm_loader::{load_vrm, load_vrm_with_extensions, LoadedVrmModel};
 pub(crate) use vrm_morph::vrm_expression_to_mmd;
+pub(crate) use vrm_morph::is_standard_vmd_expression;
+pub(crate) use vrm_mesh::skin_vertex as skin_vrm_vertex;
 
 use glam::{Vec2, Vec3};
 
@@ -50,6 +53,11 @@ pub enum VertexWeight {
     Bdef4 {
         bones: [i32; 4],
         weights: [f32; 4],
+    },
+    /// Per-skin inverse binds, expressed in the canonical model frame.
+    VrmBdef4 {
+        bones: [i32; 4], weights: [f32; 4], joints: [u16; 4],
+        binds: std::sync::Arc<Vec<glam::Mat4>>,
     },
     Sdef {
         bones: [i32; 2],

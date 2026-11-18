@@ -20,6 +20,8 @@ impl VrmModelRuntimeState {
     pub(crate) fn new(model: &mut MmdModel, extensions: VrmExtensions) -> Self {
         let mut input = VrmRuntimeInput::default();
         input.first_person = model.is_first_person_enabled();
+        let mut spring_bone=SpringBoneRuntime::new(extensions.spring_bones.clone(), &model.bone_manager);
+        spring_bone.set_terminal_tail(extensions.version==crate::model::VrmVersion::V1_0);
         Self {
             control_rig: ControlRigRuntime::new(model),
             constraints: ConstraintRuntime::new(extensions.node_constraints, &model.bone_manager),
@@ -29,7 +31,7 @@ impl VrmModelRuntimeState {
                 extensions.first_person,
                 extensions.look_at.clone(),
             ),
-            spring_bone: SpringBoneRuntime::new(extensions.spring_bones, &model.bone_manager),
+            spring_bone,
             input,
             output: VrmRuntimeOutput::default(),
         }
@@ -75,8 +77,10 @@ impl VrmModelRuntimeState {
 
     pub(crate) fn process_post_ik(&mut self, model: &mut MmdModel, delta_time: f32) {
         self.constraints.process(&mut model.bone_manager);
-        self.spring_bone
-            .process(&mut model.bone_manager, delta_time);
+        if model.is_physics_enabled() {
+            self.spring_bone.place(model.physics_placement());
+            self.spring_bone.process(&mut model.bone_manager, delta_time);
+        } else { self.spring_bone.reset(); }
     }
 
     pub(crate) fn refresh_output(&mut self, model: &mut MmdModel) {

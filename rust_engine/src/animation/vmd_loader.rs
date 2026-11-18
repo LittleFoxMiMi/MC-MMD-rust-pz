@@ -413,22 +413,32 @@ fn decode_shift_jis(bytes: &[u8]) -> String {
 pub struct VmdAnimation {
     /// Motion 数据
     motion: Motion,
+    vrm_shared_torso_motion: std::sync::OnceLock<bool>,
 }
 
 impl VmdAnimation {
     /// 从 VmdFile 创建
     pub fn from_vmd_file(vmd: VmdFile) -> Self {
-        Self { motion: vmd.motion }
+        Self::from_motion(vmd.motion)
     }
 
     /// 从 Motion 数据直接创建（供 FBX 等外部格式使用）
     pub fn from_motion(motion: Motion) -> Self {
-        Self { motion }
+        Self { motion, vrm_shared_torso_motion: std::sync::OnceLock::new() }
     }
 
     /// 获取 Motion 可变引用（用于 FBX 重定向姿态校正等后处理）
     pub fn motion_mut(&mut self) -> &mut Motion {
+        self.vrm_shared_torso_motion.take();
         &mut self.motion
+    }
+
+    pub(crate) fn motion(&self) -> &Motion {
+        &self.motion
+    }
+
+    pub(crate) fn vrm_shared_torso_motion(&self, detect: impl FnOnce(&Motion) -> bool) -> bool {
+        *self.vrm_shared_torso_motion.get_or_init(|| detect(&self.motion))
     }
 
     /// 是否包含相机数据

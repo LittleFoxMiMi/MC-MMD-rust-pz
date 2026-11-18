@@ -42,6 +42,9 @@ fn compute_single_vertex(
     weight: &VertexWeight,
     matrices: &[Mat4],
 ) -> (Vec3, Vec3) {
+    if let VertexWeight::VrmBdef4 { bones, weights, joints, binds } = weight {
+        return crate::model::skin_vrm_vertex(position, normal, bones, weights, joints, binds, matrices);
+    }
     match weight {
         VertexWeight::Bdef1 { bone } => {
             let m = get_matrix(matrices, *bone);
@@ -73,6 +76,7 @@ fn compute_single_vertex(
 
             (pos, norm.normalize_or_zero())
         }
+        VertexWeight::VrmBdef4 { .. } => unreachable!(),
         VertexWeight::Sdef {
             bones,
             weight,

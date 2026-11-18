@@ -64,7 +64,8 @@ impl Motion {
             self.camera_track.max_frame_index()
         };
 
-        bone_max.max(morph_max).max(camera_max)
+        let ik_max = self.ik_tracks.values().map(|t| t.max_frame_index()).max().unwrap_or(0);
+        bone_max.max(morph_max).max(camera_max).max(ik_max)
     }
 
     /// 插入骨骼关键帧

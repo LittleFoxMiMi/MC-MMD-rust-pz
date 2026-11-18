@@ -116,6 +116,13 @@ impl ExpressionRuntime {
         look_at_type: Option<LookAtType>,
     ) -> ExpressionRuntimeState {
         let mut merged = requested.clone();
+        for (key,name) in &self.morph_names {
+            if let Some(index)=model.morph_manager.find_morph_by_name(name) {
+                if let Some(&(_,weight))=model.pz_manual_morphs.iter().find(|(i,_)|*i==index) {
+                    merged.insert(key.clone(),weight);
+                }
+            }
+        }
         if matches!(look_at_type, Some(LookAtType::Expression)) {
             merged.extend(synthesized_look_at_weights(eye_direction));
         }

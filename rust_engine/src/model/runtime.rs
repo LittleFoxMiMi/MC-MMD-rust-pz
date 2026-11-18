@@ -44,6 +44,7 @@ struct WindowGeometrySource {
     vertices: Vec<RuntimeVertex>,
     weights: Vec<VertexWeight>,
     morphs: Vec<Vec<(usize, Vec3)>>,
+    normal_morphs: Vec<Vec<(usize, Vec3)>>,
 }
 
 /// Owns every input to a secondary view. Evaluation never locks a live model.
@@ -51,6 +52,7 @@ pub struct WindowGeometryFrame {
     source: Arc<WindowGeometrySource>,
     pub matrices: Vec<Mat4>,
     effective: Vec<f32>,
+    normals: Vec<Vec3>,
 }
 
 impl WindowGeometryFrame {
@@ -72,8 +74,7 @@ impl WindowGeometryFrame {
             }
         }
         for (slot,&index) in indices.iter().enumerate(){
-            let vertex=&self.source.vertices[index as usize];
-            let (p,n)=compute_vertex_skinning(positions[slot],vertex.normal,&self.source.weights[index as usize],matrices);
+            let (p,n)=compute_vertex_skinning(positions[slot],self.normals.get(index as usize).copied().unwrap_or(self.source.vertices[index as usize].normal),&self.source.weights[index as usize],matrices);
             // Java render space reflects X. Interleaved vec3 position + normal.
             output[slot*6..slot*6+6].copy_from_slice(&[-p.x,p.y,p.z,-n.x,n.y,n.z]);
         }
@@ -93,7 +94,7 @@ impl WindowGeometryFrame {
         }
         let (pos, norm) = output.split_at_mut(count * 3);
         pos.par_chunks_mut(3).zip(norm.par_chunks_mut(3)).enumerate().for_each(|(i,(p,n))| {
-            let (position, normal) = compute_vertex_skinning(positions[i], source.vertices[i].normal,
+            let (position, normal) = compute_vertex_skinning(positions[i], self.normals.get(i).copied().unwrap_or(source.vertices[i].normal),
                 &source.weights[i], &self.matrices);
             p.copy_from_slice(&position.to_array()); n.copy_from_slice(&normal.to_array());
         });
@@ -124,6 +125,9 @@ fn rand_float() -> f32 {
 pub struct MmdModel {
     // 静态数据
     pub name: String,
+    pub vrm_metadata: String,
+    pub(crate) vrm_material_render_states: Vec<i32>,
+    pub(crate) vrm_expression_morphs: HashSet<usize>,
     pub vertices: Vec<RuntimeVertex>,
     pub indices: Vec<u32>,
     pub weights: Vec<VertexWeight>,
@@ -180,6 +184,7 @@ pub struct MmdModel {
     /// VRM 模型标志（影响坐标系处理）
     is_vrm: bool,
     vrm_runtime_state: Option<Box<VrmModelRuntimeState>>,
+    vrm_vmd_rest: Option<super::vrm_vmd::RestBasis>,
 
     // 模型全局变换
     model_transform: Mat4,
@@ -360,6 +365,10 @@ impl MmdModel {
             debug_logged: false,
             is_vrm: false,
             vrm_runtime_state: None,
+            vrm_vmd_rest: None,
+            vrm_metadata: String::new(),
+            vrm_material_render_states: Vec::new(),
+            vrm_expression_morphs: HashSet::new(),
             model_transform: Mat4::IDENTITY,
             pz_vehicle_motion: None,
             pz_weapon_transform: None,
@@ -557,6 +566,7 @@ impl MmdModel {
             return;
         }
 
+        self.vrm_vmd_rest = Some(super::vrm_vmd::RestBasis::from_bind(&self.bone_manager));
         let mut runtime_state = VrmModelRuntimeState::new(self, extensions);
         runtime_state.initialize_output(self);
         self.vrm_runtime_state = Some(Box::new(runtime_state));
@@ -946,13 +956,14 @@ impl MmdModel {
             }
         }
         let matrices = self.camera_skinning_matrices();
+        let normals = self.morphed_normals();
         let vertices = &self.vertices;
         let weights = &self.weights;
         let (pos, norm) = output.split_at_mut(count * 3);
         pos.par_chunks_mut(3).zip(norm.par_chunks_mut(3)).enumerate()
             .for_each(|(index, (p, n))| {
                 let (position, normal) = compute_vertex_skinning(positions[index],
-                    vertices[index].normal, &weights[index], matrices);
+                    normals.get(index).copied().unwrap_or(vertices[index].normal), &weights[index], matrices);
                 p.copy_from_slice(&position.to_array());
                 n.copy_from_slice(&normal.to_array());
             });
@@ -966,11 +977,15 @@ impl MmdModel {
                     .map(|m| m.vertex_offsets.iter().map(|o| (o.vertex_index as usize, o.offset)).collect())
                     .unwrap_or_default()
             }).collect();
-            Arc::new(WindowGeometrySource { vertices: self.vertices.clone(), weights: self.weights.clone(), morphs })
+            let normal_morphs=(0..self.morph_manager.morph_count()).map(|i| self.morph_manager.get_morph(i).unwrap().normal_offsets.iter()
+                .map(|o| (o.vertex_index as usize,o.offset)).collect()).collect();
+            Arc::new(WindowGeometrySource { vertices: self.vertices.clone(), weights: self.weights.clone(), morphs, normal_morphs })
         }).clone();
         let mut effective = vec![0.0; self.morph_manager.morph_count()];
         self.morph_manager.compute_effective_weights_into(&mut effective);
-        WindowGeometryFrame { source, matrices: self.camera_skinning_matrices().to_vec(), effective }
+        let mut normals:Vec<_>=if self.is_vrm {source.vertices.iter().map(|v|v.normal).collect()}else{Vec::new()};
+        for (offsets,&w) in source.normal_morphs.iter().zip(&effective) { if w!=0. { for &(i,n) in offsets { normals[i]+=n*w; } } }
+        WindowGeometryFrame { source, matrices: self.camera_skinning_matrices().to_vec(), effective, normals }
     }
 
     /// Eye-tail anchor from the view-following pose before render-only head scaling.
@@ -1211,8 +1226,20 @@ impl MmdModel {
         self.bone_manager.update_transforms(after_physics);
     }
 
+    fn morphed_normals(&self) -> Vec<Vec3> {
+        if !self.is_vrm {return Vec::new();}
+        let mut normals:Vec<_>=self.vertices.iter().map(|v|v.normal).collect();
+        let mut effective=vec![0.;self.morph_manager.morph_count()];
+        self.morph_manager.compute_effective_weights_into(&mut effective);
+        for (i,w) in effective.into_iter().enumerate() {
+            if w==0. {continue;}
+            for o in &self.morph_manager.get_morph(i).unwrap().normal_offsets { normals[o.vertex_index as usize]+=o.offset*w; }
+        }
+        normals
+    }
     /// 更新顶点（蒙皮计算）- 使用 rayon 并行加速
     pub fn update(&mut self) {
+        let morph_normals=self.morphed_normals();
         let bone_matrices = self.bone_manager.get_skinning_matrices();
         let vertex_count = self.vertices.len();
         let raw_len = vertex_count * 3;
@@ -1237,8 +1264,8 @@ impl MmdModel {
             });
 
         // 并行蒙皮计算
-        let vertices = &self.vertices;
         let weights = &self.weights;
+        let vertices = &self.vertices;
 
         // 将输出切片分块，每个顶点对应 3 个 f32
         let pos_raw = &mut self.update_positions_raw;
@@ -1252,15 +1279,15 @@ impl MmdModel {
             .zip(normals.par_iter_mut())
             .zip(pos_raw.par_chunks_mut(3))
             .zip(norm_raw.par_chunks_mut(3))
-            .zip(vertices.par_iter())
+            .zip(vertices.par_iter().enumerate())
             .zip(weights.par_iter())
             .for_each(
-                |(((((pos_out, norm_out), pos_chunk), norm_chunk), vertex), weight)| {
+                |(((((pos_out, norm_out), pos_chunk), norm_chunk), (i,vertex)), weight)| {
                     // 使用 pos_out（即 update_positions，已应用 Morph）作为蒙皮输入
                     let morph_position = *pos_out;
                     let (pos, norm) = compute_vertex_skinning(
                         morph_position, // 使用已应用 Morph 的位置
-                        vertex.normal,
+                        morph_normals.get(i).copied().unwrap_or(vertex.normal),
                         weight,
                         &bone_matrices,
                     );
@@ -2036,7 +2063,7 @@ impl MmdModel {
                     self.bone_weights[base] = *weight;
                     self.bone_weights[base + 1] = 1.0 - *weight;
                 }
-                VertexWeight::Bdef4 { bones, weights } => {
+                VertexWeight::Bdef4 { bones, weights } | VertexWeight::VrmBdef4 { bones, weights, .. } => {
                     for j in 0..4 {
                         self.bone_indices[base + j] = bones[j];
                         self.bone_weights[base + j] = weights[j];
@@ -2662,11 +2689,26 @@ impl MmdModel {
         });
 
         for &(index, weight) in &self.pz_manual_morphs {
+            if self.is_vrm && self.vrm_expression_morphs.contains(&index) {continue;}
             self.morph_manager.set_morph_weight(index, weight);
         }
         let mut pz_replacement = false;
+        let vrm_facial_baseline = if self.is_vrm && self.pz_vmd_layers.iter().any(|(_, _, add)| !add) {
+            super::vrm_vmd::facial_baseline(&self.morph_manager)
+        } else { Vec::new() };
         for (animation, frame, additive) in &self.pz_vmd_layers {
-            if *additive {
+            if self.is_vrm {
+                if !additive {
+                    pz_replacement = true;
+                    self.bone_manager.reset_all_transforms();
+                    self.bone_manager.reset_all_ik_enabled();
+                    for &(index, weight) in &vrm_facial_baseline {
+                        self.morph_manager.set_morph_weight(index, weight);
+                    }
+                }
+                super::vrm_vmd::evaluate(animation, *frame, *additive, self.vrm_vmd_rest.as_ref(),
+                    &mut self.bone_manager, &mut self.morph_manager);
+            } else if *additive {
                 animation.evaluate_additive(*frame, &mut self.bone_manager, &mut self.morph_manager);
             } else {
                 pz_replacement = true;
@@ -2715,6 +2757,8 @@ impl MmdModel {
             }
         }
         for &(index, weight) in &self.pz_expression_morphs {
+            if self.is_vrm && !self.morph_manager.get_morph(index)
+                .is_some_and(|m| super::is_standard_vmd_expression(&m.name)) { continue; }
             self.morph_manager.set_morph_weight(index, weight);
         }
         if !self.pz_playback_ik {
@@ -2794,6 +2838,7 @@ impl MmdModel {
     }
 
     pub fn init_physics(&mut self) -> bool {
+        if self.is_vrm { self.physics_enabled=true; self.reset_physics(); return true; }
         self.set_async_physics(false);
         if self.rigid_bodies.is_empty() {
             log::debug!("模型没有刚体数据，跳过物理初始化");
@@ -2829,7 +2874,9 @@ impl MmdModel {
     }
 
     /// 重置物理系统
+    pub(crate) fn physics_placement(&self) -> Mat4 { self.model_transform }
     pub fn reset_physics(&mut self) {
+        if let Some(runtime)=self.vrm_runtime_state.as_mut() { runtime.spring_bone.reset(); }
         if let Some(ref worker) = self.async_physics { worker.reset(); }
         if let Some(ref mut physics) = self.physics {
             physics.reset();
@@ -2851,7 +2898,7 @@ impl MmdModel {
 
     /// 获取物理系统是否已初始化
     pub fn has_physics(&self) -> bool {
-        self.physics.is_some() || self.async_physics.is_some()
+        self.is_vrm || self.physics.is_some() || self.async_physics.is_some()
     }
 
     pub fn set_async_physics(&mut self, enabled: bool) {
@@ -3173,7 +3220,7 @@ impl MmdModel {
                     VertexWeight::Bdef2 { bones, weight } => {
                         vec![(bones[0], *weight), (bones[1], 1.0 - *weight)]
                     }
-                    VertexWeight::Bdef4 { bones, weights } => {
+                    VertexWeight::Bdef4 { bones, weights } | VertexWeight::VrmBdef4 { bones, weights, .. } => {
                         (0..4).map(|j| (bones[j], weights[j])).collect()
                     }
                     VertexWeight::Sdef { bones, weight, .. } => {
@@ -3625,9 +3672,9 @@ mod tests {
             VertexWeight::Qdef{bones:[0,1,0,1],weights:[0.1,0.2,0.3,0.4]}];
         let source=Arc::new(WindowGeometrySource{
             vertices:(0..5).map(|i|RuntimeVertex{position:Vec3::new(i as f32,1.0,0.2),normal:Vec3::Y,uv:Vec2::ZERO}).collect(),
-            weights,morphs:vec![vec![(1,Vec3::X),(3,Vec3::Z),(4,Vec3::Y)]]});
-        let a=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.2]};
-        let b=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.8]};
+            weights,normal_morphs:vec![],morphs:vec![vec![(1,Vec3::X),(3,Vec3::Z),(4,Vec3::Y)]]});
+        let a=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.2],normals:vec![Vec3::Y;5]};
+        let b=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.8],normals:vec![Vec3::Y;5]};
         let live=vec![Mat4::from_rotation_translation(Quat::from_rotation_z(0.8),Vec3::X),
             Mat4::from_rotation_translation(Quat::from_rotation_y(-0.5),Vec3::Z)];
         let ids=[0,1,3,4];let mut result=[0.0;24];
@@ -3925,6 +3972,9 @@ fn compute_vertex_skinning(
     weight: &VertexWeight,
     matrices: &[Mat4],
 ) -> (Vec3, Vec3) {
+    if let VertexWeight::VrmBdef4 { bones, weights, joints, binds } = weight {
+        return super::vrm_mesh::skin_vertex(position, normal, bones, weights, joints, binds, matrices);
+    }
     match weight {
         VertexWeight::Bdef1 { bone } => {
             let m = matrices
@@ -3968,6 +4018,7 @@ fn compute_vertex_skinning(
 
             (pos, norm.normalize_or_zero())
         }
+        VertexWeight::VrmBdef4 { .. } => unreachable!(),
         VertexWeight::Sdef {
             bones,
             weight,

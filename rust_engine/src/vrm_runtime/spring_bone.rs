@@ -79,10 +79,15 @@ struct ResolvedCollider {
 pub struct SpringBoneRuntime {
     chains: Vec<SpringChainRuntime>,
     colliders: Vec<ResolvedCollider>,
+    source: SpringBoneData,
+    pending_reset: bool,
+    placement: Option<Mat4>,
+    terminal_tail: bool,
 }
 
 impl SpringBoneRuntime {
     pub fn new(spring_bones: SpringBoneData, bones: &BoneManager) -> Self {
+        let source=spring_bones.clone();
         let SpringBoneData {
             springs,
             colliders,
@@ -105,10 +110,40 @@ impl SpringBoneRuntime {
             .filter_map(|spring| resolve_chain(spring, &spring_meta, &colliders, bones))
             .collect();
 
-        Self { chains, colliders }
+        Self { chains, colliders, source, pending_reset:true, placement:None, terminal_tail:false }
     }
 
+    pub fn reset(&mut self) { self.pending_reset=true; self.placement=None; }
+    pub fn set_terminal_tail(&mut self, terminal_tail:bool) { self.terminal_tail=terminal_tail; }
+    pub fn place(&mut self, placement: Mat4) {
+        if let Some(previous)=self.placement {
+            let delta=placement.inverse()*previous;
+            if delta.is_finite() { for chain in &mut self.chains { for joint in &mut chain.joints {
+                if matches!(joint.state.space,TailSpace::World) {
+                    joint.state.current_tail=delta.transform_point3(joint.state.current_tail);
+                    joint.state.prev_tail=delta.transform_point3(joint.state.prev_tail);
+                }
+            } } }
+        }
+        self.placement=Some(placement);
+    }
     pub fn process(&mut self, bones: &mut BoneManager, delta_time: f32) {
+        if self.pending_reset {
+            let placement=self.placement; let terminal_tail=self.terminal_tail;
+            let mut rebuilt=Self::new(self.source.clone(),bones);
+            if terminal_tail {
+                let tails:std::collections::HashSet<_>=rebuilt.source.springs.iter().filter_map(|s|s.joints.last().map(|j|j.node)).collect();
+                for chain in &mut rebuilt.chains {chain.joints.retain(|j|!tails.contains(&j.bone_index));}
+            }
+            rebuilt.pending_reset=false; rebuilt.placement=placement; rebuilt.terminal_tail=terminal_tail;
+            *self=rebuilt;
+        }
+        if !delta_time.is_finite() || delta_time<=0. { return; }
+        let total=delta_time.min(0.1);
+        let steps=(total*60.).ceil().max(1.) as usize;
+        for _ in 0..steps { self.step(bones,total/steps as f32); }
+    }
+    fn step(&mut self, bones: &mut BoneManager, delta_time: f32) {
         if self.chains.is_empty() || delta_time <= 0.0 {
             return;
         }
@@ -128,7 +163,7 @@ impl SpringBoneRuntime {
                     .unwrap_or(Quat::IDENTITY);
 
                 let mut next_tail = current_tail
-                    + (current_tail - prev_tail) * (1.0 - joint.drag_force)
+                    + (current_tail - prev_tail) * (1.0 - joint.drag_force).powf(delta_time*60.0)
                     + (parent_rotation * joint.init_local_rotation * joint.bone_axis)
                         * (joint.stiffness * delta_time)
                     + joint.gravity_dir * (joint.gravity_power * delta_time);
@@ -231,11 +266,10 @@ fn resolve_joint(
 ) -> Option<SpringJointRuntime> {
     let bone = bones.get_bone(joint.node)?;
     let bone_transform = bone.global_transform();
-    let child_world_position = if let Some(next_joint) = next_joint {
-        bones.get_bone(next_joint.node)?.position()
-    } else {
-        virtual_tail_world_position(bone, bones)?
-    };
+    let next=next_joint.filter(|j| bones.get_bone(j.node).and_then(|b| b.parent_id())==Some(joint.node));
+    let child_world_position = if let Some(next)=next { bones.get_bone(next.node)?.position() }
+        else if let Some(child)=(0..bones.bone_count()).filter_map(|i| bones.get_bone(i)).find(|b| b.parent_id()==Some(joint.node)) { child.position() }
+        else { virtual_tail_world_position(bone,bones)? };
 
     let local_child_position = bone_transform
         .inverse()
@@ -275,7 +309,7 @@ fn virtual_tail_world_position(bone: &crate::skeleton::Bone, bones: &BoneManager
     if direction.length_squared() <= 1e-6 {
         return None;
     }
-    Some(bone.position() + direction * 0.07)
+    Some(bone.position() + direction * 0.875)
 }
 
 fn to_tail_space(space: TailSpace, world: Vec3, bones: &BoneManager) -> Vec3 {

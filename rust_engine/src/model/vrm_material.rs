@@ -171,18 +171,104 @@ fn build_draw_flags(mat: &gltf::Material, mtoon: Option<&MtoonParams>) -> u8 {
     flags
 }
 
-/// 根据 alphaMode 计算最终 alpha 值
+// Packed JNI row: alpha mode (1 opaque, 2 mask, 3 blend), depth write,
+// render queue, and the bit pattern of the effective texture-alpha cutoff.
+// MASK is binary: bake baseColorFactor.a into the threshold, leaving the
+// runtime material opacity available as an independent user control.
+pub(crate) fn render_state(material: &serde_json::Value, vrm0: &serde_json::Value) -> [i32; 4] {
+    use serde_json::Value;
+    match material["alphaMode"].as_str() {
+        Some("BLEND") => {
+            let mtoon = &material["extensions"]["VRMC_materials_mtoon"];
+            let (depth, queue) = if vrm0["shader"].as_str() == Some("VRM/MToon") {
+                let floats = &vrm0["floatProperties"];
+                let depth = floats["_ZWrite"].as_f64().map_or_else(
+                    || floats["_BlendMode"].as_f64() == Some(3.0),
+                    |value| value > 0.5,
+                );
+                let queue = vrm0["renderQueue"]
+                    .as_i64()
+                    .filter(|q| (0..=5000).contains(q))
+                    .unwrap_or(if depth { 2501 } else { 3000 });
+                (depth, queue)
+            } else {
+                let depth = mtoon["transparentWithZWrite"].as_bool().unwrap_or(false);
+                let offset = mtoon["renderQueueOffsetNumber"].as_i64().unwrap_or(0);
+                let queue = if depth {
+                    2501 + offset.clamp(0, 9)
+                } else {
+                    3000 + offset.clamp(-9, 0)
+                };
+                (depth, queue)
+            };
+            [3, i32::from(depth), queue as i32, 0]
+        }
+        Some("MASK") => {
+            let alpha = material["pbrMetallicRoughness"]["baseColorFactor"]
+                .get(3)
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let cutoff = material["alphaCutoff"].as_f64().unwrap_or(0.5).max(0.0);
+            let threshold = if cutoff == 0.0 {
+                0.0
+            } else if alpha == 0.0 {
+                2.0
+            } else {
+                (cutoff / alpha).min(2.0) as f32
+            };
+            [2, 1, 2450, threshold.to_bits() as i32]
+        }
+        _ => [1, 1, 2000, 0],
+    }
+}
+
 fn compute_alpha(mat: &gltf::Material, base_alpha: f32) -> f32 {
     match mat.alpha_mode() {
-        gltf::material::AlphaMode::Opaque => 1.0,
-        gltf::material::AlphaMode::Mask => {
-            let cutoff = mat.alpha_cutoff().unwrap_or(0.5);
-            if base_alpha >= cutoff {
-                1.0
-            } else {
-                0.0
-            }
-        }
         gltf::material::AlphaMode::Blend => base_alpha,
+        _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_state;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn vrm_zero_mtoon_keeps_explicit_queue_and_depth_write() {
+        let blend = json!({"alphaMode": "BLEND"});
+        let source = json!({"shader":"VRM/MToon", "renderQueue":2501,
+            "floatProperties":{"_ZWrite":1.0,"_BlendMode":3.0}});
+        assert_eq!(render_state(&blend, &source), [3, 1, 2501, 0]);
+        assert_eq!(render_state(&json!({}), &source), [1, 1, 2000, 0]);
+    }
+
+    #[test]
+    fn vrm_one_separates_zwrite_blend_from_default_blend() {
+        let blend = |depth, offset| {
+            json!({"alphaMode":"BLEND", "extensions":{
+                "VRMC_materials_mtoon":{"transparentWithZWrite":depth,"renderQueueOffsetNumber":offset}
+            }})
+        };
+        assert_eq!(render_state(&blend(true, 4), &Value::Null), [3, 1, 2505, 0]);
+        assert_eq!(
+            render_state(&blend(false, -2), &Value::Null),
+            [3, 0, 2998, 0]
+        );
+        assert_eq!(
+            render_state(&json!({"alphaMode":"BLEND"}), &Value::Null),
+            [3, 0, 3000, 0]
+        );
+    }
+
+    #[test]
+    fn alpha_mask_threshold_includes_authored_base_colour_factor() {
+        let masked = json!({"alphaMode":"MASK", "alphaCutoff":0.4,
+            "pbrMetallicRoughness":{"baseColorFactor":[1.0,1.0,1.0,0.5]}});
+        assert_eq!(
+            render_state(&masked, &Value::Null),
+            [2, 1, 2450, 0.8_f32.to_bits() as i32]
+        );
     }
 }

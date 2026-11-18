@@ -47,6 +47,7 @@ impl ExpressionOverride {
 #[derive(Debug, Clone)]
 pub struct VrmExpressionClip {
     pub morph_target_binds: Vec<(usize, f32)>,
+    pub scoped_binds: Vec<(usize, usize, f32)>,
     pub is_binary: bool,
     pub override_blink: ExpressionOverride,
     pub override_look_at: ExpressionOverride,
@@ -57,6 +58,7 @@ impl Default for VrmExpressionClip {
     fn default() -> Self {
         Self {
             morph_target_binds: Vec::new(),
+            scoped_binds: Vec::new(),
             is_binary: false,
             override_blink: ExpressionOverride::None,
             override_look_at: ExpressionOverride::None,
@@ -384,6 +386,13 @@ fn parse_humanoid_0x(vrm: &Value) -> crate::Result<HumanoidMapping> {
             let name = bone.get("bone").and_then(Value::as_str);
             let node = bone.get("node").and_then(Value::as_u64);
             if let (Some(name), Some(node)) = (name, node) {
+                let name=match name {
+                    "leftThumbProximal"=>"leftThumbMetacarpal",
+                    "leftThumbIntermediate"=>"leftThumbProximal",
+                    "rightThumbProximal"=>"rightThumbMetacarpal",
+                    "rightThumbIntermediate"=>"rightThumbProximal",
+                    other=>other,
+                };
                 map.insert(node as usize, name.to_string());
             }
         }
@@ -433,8 +442,10 @@ fn parse_expressions_0x(vrm: &Value) -> VrmExpressions {
                     let index = bind.get("index").and_then(Value::as_u64);
                     let weight = bind.get("weight").and_then(Value::as_f64);
                     if let (Some(index), Some(weight)) = (index, weight) {
-                        clip.morph_target_binds
-                            .push((index as usize, (weight / 100.0) as f32));
+                        if let Some(mesh) = bind.get("mesh").and_then(Value::as_u64) {
+                            clip.scoped_binds.push((mesh as usize, index as usize, (weight / 100.0) as f32));
+                        }
+                        clip.morph_target_binds.push((index as usize, (weight / 100.0) as f32));
                     }
                 }
             }
@@ -474,8 +485,10 @@ fn parse_expression_group(group: Option<&Value>, map: &mut HashMap<String, VrmEx
                 let index = bind.get("index").and_then(Value::as_u64);
                 let weight = bind.get("weight").and_then(Value::as_f64);
                 if let (Some(index), Some(weight)) = (index, weight) {
-                    clip.morph_target_binds
-                        .push((index as usize, weight as f32));
+                    if let Some(node) = bind.get("node").and_then(Value::as_u64) {
+                        clip.scoped_binds.push((node as usize, index as usize, weight as f32));
+                    }
+                    clip.morph_target_binds.push((index as usize, weight as f32));
                 }
             }
         }
@@ -1055,17 +1068,13 @@ fn build_node_children_map(json_root: &gltf_json::Root) -> HashMap<usize, Vec<us
 }
 
 fn collect_bone_chain(root: usize, children_map: &HashMap<usize, Vec<usize>>) -> Vec<usize> {
-    let mut chain = vec![root];
-    let mut current = root;
-    loop {
-        let Some(children) = children_map.get(&current) else {
-            break;
-        };
-        let Some(next) = children.first().copied() else {
-            break;
-        };
-        chain.push(next);
-        current = next;
+    let mut chain=vec![];
+    let mut stack=vec![root];
+    let mut visited=HashSet::new();
+    while let Some(node)=stack.pop() {
+        if !visited.insert(node) {continue;}
+        chain.push(node);
+        if let Some(children)=children_map.get(&node) { stack.extend(children.iter().rev()); }
     }
     chain
 }

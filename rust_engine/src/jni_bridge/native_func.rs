@@ -16,6 +16,36 @@ use super::{
     TEXTURE_PATH_INDEX,
 };
 
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetVRMMetadata(env:JNIEnv,_class:JClass,handle:jlong)->jstring {
+    let Some(model)=MODELS.read().unwrap().get(&handle).cloned() else {return ptr::null_mut();};
+    let value=model.lock().unwrap().vrm_metadata.clone();
+    env.new_string(value).map(|s|s.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetVRMMaterialParameters(env:JNIEnv,_class:JClass,handle:jlong,index:jint)->jstring {
+    let Some(model)=MODELS.read().unwrap().get(&handle).cloned() else {return ptr::null_mut();};
+    let model=model.lock().unwrap();
+    let Ok(value)=serde_json::from_str::<serde_json::Value>(&model.vrm_metadata) else {return ptr::null_mut();};
+    if index<0 || index as usize>=model.materials.len() {return ptr::null_mut();}
+    let i=index as usize;
+    let source=serde_json::json!({"gltf":value["materials"][i],"vrm0":value["extensions"]["VRM"]["materialProperties"][i]});
+    env.new_string(source.to_string()).map(|s|s.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_GetVRMMaterialRenderStates(
+    env: JNIEnv, _class: JClass, handle: jlong,
+) -> jni::sys::jintArray {
+    let Some(model) = MODELS.read().unwrap().get(&handle).cloned() else { return ptr::null_mut(); };
+    let model = model.lock().unwrap();
+    let states = &model.vrm_material_render_states;
+    let Ok(array) = env.new_int_array(states.len() as i32) else { return ptr::null_mut(); };
+    if env.set_int_array_region(&array, 0, states).is_err() { return ptr::null_mut(); }
+    array.into_raw()
+}
+
 const VERSION: &str = "v1.0.6";
 const ADDITIVE_ROTATION_STRIDE: usize = 4;
 const ADDITIVE_TRANSFORM_STRIDE: usize = 10;

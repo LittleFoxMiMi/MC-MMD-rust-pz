@@ -4,10 +4,21 @@ use glam::Vec3;
 
 use super::vrm_extensions::VrmExpressions;
 use super::vrm_mesh::MorphTargetData;
-use crate::morph::{Morph, MorphManager, MorphType, VertexMorphOffset};
+use crate::morph::{GroupMorphOffset, Morph, MorphManager, MorphType, VertexMorphOffset};
 
 /// 近零阈值，过滤无效偏移节省内存
 const EPSILON: f32 = 1e-6;
+
+pub(crate) const VMD_EXPRESSIONS: &[&str] = &[
+    "まばたき", "ウィンク", "ウィンク右", "ウィンク２", "ｳｨﾝｸ２右", "笑い",
+    "なごみ", "はぅ", "びっくり", "じと目", "ｷﾘｯ", "瞳小", "瞳大",
+    "あ", "い", "う", "え", "お", "ん", "▲", "∧", "ω", "ω□", "にやり",
+    "にやり２", "にこり", "への字", "困る", "怒り", "悲しい", "上", "下", "真面目",
+];
+
+pub(crate) fn is_standard_vmd_expression(name: &str) -> bool {
+    VMD_EXPRESSIONS.contains(&name)
+}
 
 /// VRM 表情名 → MMD 日文表情名（输入已统一为小写）
 pub(crate) fn vrm_expression_to_mmd(vrm_name: &str) -> &str {
@@ -39,7 +50,7 @@ fn collect_vertex_offsets(target: &MorphTargetData) -> Vec<VertexMorphOffset> {
         .enumerate()
         .filter(|(_, offset)| offset.length_squared() > EPSILON * EPSILON)
         .map(|(i, &offset)| VertexMorphOffset {
-            vertex_index: i as u32,
+            vertex_index: (target.vertex_offset + i) as u32,
             offset,
         })
         .collect()
@@ -64,8 +75,11 @@ pub(crate) fn convert_morph_targets(
             idx,
             offsets.len()
         );
-        let mut morph = Morph::new(format!("morph_{}", idx), MorphType::Vertex);
+        let mut morph = Morph::new(target.name.clone(), MorphType::Vertex);
         morph.vertex_offsets = offsets;
+        morph.weight = target.default_weight;
+        morph.normal_offsets = target.normal_offsets.iter().enumerate().filter(|(_,v)| v.length_squared()>EPSILON*EPSILON)
+            .map(|(i,&offset)| VertexMorphOffset { vertex_index:(target.vertex_offset+i) as u32, offset }).collect();
         manager.add_morph(morph);
     }
 
@@ -76,7 +90,9 @@ pub(crate) fn convert_morph_targets(
     );
 
     // 阶段2：将 VRM expressions 烘焙为组合 Vertex Morph（MMD 日文名）
-    for (expr_name, clip) in &vrm_expressions.map {
+    let mut expressions: Vec<_> = vrm_expressions.map.iter().collect();
+    expressions.sort_by_key(|(name, _)| *name);
+    for (expr_name, clip) in expressions {
         let mmd_name = vrm_expression_to_mmd(expr_name).to_string();
         let binds = &clip.morph_target_binds;
 
@@ -93,20 +109,34 @@ pub(crate) fn convert_morph_targets(
             binds,
             combined_offsets.len()
         );
-        if combined_offsets.is_empty() {
+        if combined_offsets.is_empty() && !binds.iter().any(|&(i,_)| morph_targets.get(i).map(|m| !m.normal_offsets.is_empty()).unwrap_or(false)) {
             log::warn!("VRM 表情 '{}' 烘焙结果为空，跳过注册", expr_name);
             continue;
         }
 
         let mut morph = Morph::new(mmd_name, MorphType::Vertex);
         morph.vertex_offsets = combined_offsets;
+        let mut normals=vec![Vec3::ZERO;vertex_count];
+        for &(i,w) in binds { if let Some(t)=morph_targets.get(i) { for (j,&n) in t.normal_offsets.iter().enumerate() { normals[t.vertex_offset+j]+=n*w; } } }
+        morph.normal_offsets=normals.into_iter().enumerate().filter(|(_,n)| n.length_squared()>EPSILON*EPSILON)
+            .map(|(i,offset)| VertexMorphOffset { vertex_index:i as u32,offset }).collect();
         manager.add_morph(morph);
     }
 
-    log::info!(
-        "VRM Morph 阶段2完成: MorphManager 共 {} 个 morph",
-        manager.morph_count()
-    );
+    // Keep per-instance sliders and expose a shared facial track for an exact
+    // authored name unless a baked VRM expression already owns it.
+    for &name in VMD_EXPRESSIONS {
+        if manager.find_morph_by_name(name).is_some() { continue; }
+        let offsets: Vec<_> = morph_targets.iter().enumerate()
+            .filter(|(_, target)| target.source_name == name)
+            .map(|(index, _)| GroupMorphOffset { morph_index: index as u32, influence: 1.0 })
+            .collect();
+        if !offsets.is_empty() {
+            let mut morph = Morph::new(name.to_string(), MorphType::Group);
+            morph.group_offsets = offsets;
+            manager.add_morph(morph);
+        }
+    }
     manager
 }
 
@@ -121,6 +151,7 @@ fn bake_expression_offsets(
     for &(target_idx, weight) in binds {
         if let Some(target) = morph_targets.get(target_idx) {
             for (i, &offset) in target.position_offsets.iter().enumerate() {
+                let i = i + target.vertex_offset;
                 if i < vertex_count {
                     combined[i] += offset * weight;
                 }

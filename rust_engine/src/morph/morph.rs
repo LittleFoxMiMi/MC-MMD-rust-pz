@@ -14,6 +14,7 @@ pub struct Morph {
 
     // 顶点 Morph
     pub vertex_offsets: Vec<VertexMorphOffset>,
+    pub normal_offsets: Vec<VertexMorphOffset>,
 
     // 骨骼 Morph
     pub bone_offsets: Vec<BoneMorphOffset>,
@@ -35,6 +36,7 @@ impl Morph {
             morph_type,
             weight: 0.0,
             vertex_offsets: Vec::new(),
+            normal_offsets: Vec::new(),
             bone_offsets: Vec::new(),
             material_offsets: Vec::new(),
             uv_offsets: Vec::new(),
