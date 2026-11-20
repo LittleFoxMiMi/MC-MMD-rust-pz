@@ -1,5 +1,7 @@
 //! Morph 定义
 
+use std::sync::Arc;
+
 use super::{
     BoneMorphOffset, GroupMorphOffset, MaterialMorphOffset, MorphType, UvMorphOffset,
     VertexMorphOffset,
@@ -13,8 +15,8 @@ pub struct Morph {
     pub weight: f32,
 
     // 顶点 Morph
-    pub vertex_offsets: Vec<VertexMorphOffset>,
-    pub normal_offsets: Vec<VertexMorphOffset>,
+    pub vertex_offsets: Arc<Vec<VertexMorphOffset>>,
+    pub normal_offsets: Arc<Vec<VertexMorphOffset>>,
 
     // 骨骼 Morph
     pub bone_offsets: Vec<BoneMorphOffset>,
@@ -23,7 +25,7 @@ pub struct Morph {
     pub material_offsets: Vec<MaterialMorphOffset>,
 
     // UV Morph
-    pub uv_offsets: Vec<UvMorphOffset>,
+    pub uv_offsets: Arc<Vec<UvMorphOffset>>,
 
     // Group Morph 子项
     pub group_offsets: Vec<GroupMorphOffset>,
@@ -35,11 +37,11 @@ impl Morph {
             name,
             morph_type,
             weight: 0.0,
-            vertex_offsets: Vec::new(),
-            normal_offsets: Vec::new(),
+            vertex_offsets: Arc::default(),
+            normal_offsets: Arc::default(),
             bone_offsets: Vec::new(),
             material_offsets: Vec::new(),
-            uv_offsets: Vec::new(),
+            uv_offsets: Arc::default(),
             group_offsets: Vec::new(),
         }
     }

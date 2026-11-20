@@ -199,14 +199,14 @@ pub fn load_pmx<P: AsRef<Path>>(path: P) -> Result<MmdModel> {
 
     let mut model = MmdModel::new();
     model.name = model_name;
-    model.vertices = vertices;
-    model.indices = indices;
-    model.weights = weights;
-    model.materials = materials;
-    model.submeshes = submeshes;
-    model.texture_paths = texture_paths;
-    model.rigid_bodies = rigid_bodies;
-    model.joints = joints;
+    model.vertices = vertices.into();
+    model.indices = indices.into();
+    model.weights = weights.into();
+    model.materials = materials.into();
+    model.submeshes = submeshes.into();
+    model.texture_paths = texture_paths.into();
+    model.rigid_bodies = rigid_bodies.into();
+    model.joints = joints.into();
     model.update_positions = update_positions;
     model.update_normals = update_normals;
     model.update_uvs = update_uvs;
@@ -263,7 +263,7 @@ fn convert_pmx_morph(pmx_morph: &mmd::pmx::morph::Morph<DefaultConfig>) -> crate
                     vertex_index: o.vertex as u32,
                     offset: Vec3::new(o.offset[0], o.offset[1], -o.offset[2]),
                 })
-                .collect();
+                .collect::<Vec<_>>().into();
             m
         }
         Offsets::Bone(offsets) => {
@@ -322,7 +322,7 @@ fn convert_pmx_morph(pmx_morph: &mmd::pmx::morph::Morph<DefaultConfig>) -> crate
                     vertex_index: o.vertex as u32,
                     offset: vec4_from_arr(o.offset),
                 })
-                .collect();
+                .collect::<Vec<_>>().into();
             m
         }
         Offsets::AdditionalUV1(offsets) => {
@@ -333,7 +333,7 @@ fn convert_pmx_morph(pmx_morph: &mmd::pmx::morph::Morph<DefaultConfig>) -> crate
                     vertex_index: o.vertex as u32,
                     offset: vec4_from_arr(o.offset),
                 })
-                .collect();
+                .collect::<Vec<_>>().into();
             m
         }
         Offsets::AdditionalUV2(_) => {

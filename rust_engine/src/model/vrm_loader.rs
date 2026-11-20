@@ -202,14 +202,14 @@ pub fn load_vrm_with_extensions<P: AsRef<Path>>(path: P) -> Result<LoadedVrmMode
             &raw["extensions"]["VRM"]["materialProperties"][i])
     }).collect();
     model.set_vrm(true);
-    model.vertices = mesh.vertices;
-    model.indices = mesh.indices;
-    model.weights = mesh.weights;
-    model.materials = materials;
-    model.submeshes = mesh.submeshes;
-    model.texture_paths = texture_paths;
-    model.rigid_bodies = Vec::new();
-    model.joints = Vec::new();
+    model.vertices = mesh.vertices.into();
+    model.indices = mesh.indices.into();
+    model.weights = mesh.weights.into();
+    model.materials = materials.into();
+    model.submeshes = mesh.submeshes.into();
+    model.texture_paths = texture_paths.into();
+    model.rigid_bodies = Vec::new().into();
+    model.joints = Vec::new().into();
     model.update_positions = update_positions;
     model.update_normals = update_normals;
     model.update_uvs = update_uvs;

@@ -183,8 +183,8 @@ mod tests {
         );
 
         let mut model = MmdModel::new();
-        model.materials = vec![Default::default(), Default::default(), Default::default()];
-        model.submeshes = vec![];
+        model.materials = vec![Default::default(), Default::default(), Default::default()].into();
+        model.submeshes = vec![].into();
         let snapshot = runtime
             .capture_from_annotations(&mut model, &[true, true, true], true)
             .expect("annotation snapshot");
@@ -216,8 +216,8 @@ mod tests {
         );
 
         let mut model = MmdModel::new();
-        model.materials = vec![Default::default(), Default::default(), Default::default()];
-        model.submeshes = vec![];
+        model.materials = vec![Default::default(), Default::default(), Default::default()].into();
+        model.submeshes = vec![].into();
 
         let snapshot = runtime
             .capture_from_annotations(&mut model, &[false, false, false], true)

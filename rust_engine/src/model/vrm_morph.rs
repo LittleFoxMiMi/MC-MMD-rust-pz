@@ -76,10 +76,10 @@ pub(crate) fn convert_morph_targets(
             offsets.len()
         );
         let mut morph = Morph::new(target.name.clone(), MorphType::Vertex);
-        morph.vertex_offsets = offsets;
+        morph.vertex_offsets = offsets.into();
         morph.weight = target.default_weight;
         morph.normal_offsets = target.normal_offsets.iter().enumerate().filter(|(_,v)| v.length_squared()>EPSILON*EPSILON)
-            .map(|(i,&offset)| VertexMorphOffset { vertex_index:(target.vertex_offset+i) as u32, offset }).collect();
+            .map(|(i,&offset)| VertexMorphOffset { vertex_index:(target.vertex_offset+i) as u32, offset }).collect::<Vec<_>>().into();
         manager.add_morph(morph);
     }
 
@@ -115,11 +115,11 @@ pub(crate) fn convert_morph_targets(
         }
 
         let mut morph = Morph::new(mmd_name, MorphType::Vertex);
-        morph.vertex_offsets = combined_offsets;
+        morph.vertex_offsets = combined_offsets.into();
         let mut normals=vec![Vec3::ZERO;vertex_count];
         for &(i,w) in binds { if let Some(t)=morph_targets.get(i) { for (j,&n) in t.normal_offsets.iter().enumerate() { normals[t.vertex_offset+j]+=n*w; } } }
         morph.normal_offsets=normals.into_iter().enumerate().filter(|(_,n)| n.length_squared()>EPSILON*EPSILON)
-            .map(|(i,offset)| VertexMorphOffset { vertex_index:i as u32,offset }).collect();
+            .map(|(i,offset)| VertexMorphOffset { vertex_index:i as u32,offset }).collect::<Vec<_>>().into();
         manager.add_morph(morph);
     }
 

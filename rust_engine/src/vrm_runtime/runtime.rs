@@ -62,10 +62,10 @@ impl VrmRuntime {
         let assets = RuntimeAssets {
             name: model.name.clone(),
             vertex_count: model.vertex_count(),
-            indices: model.indices.clone(),
-            materials: model.materials.clone(),
-            submeshes: model.submeshes.clone(),
-            texture_paths: model.texture_paths.clone(),
+            indices: model.indices.to_vec(),
+            materials: model.materials.to_vec(),
+            submeshes: model.submeshes.to_vec(),
+            texture_paths: model.texture_paths.to_vec(),
         };
 
         Self { model, assets }

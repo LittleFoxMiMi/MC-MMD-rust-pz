@@ -592,7 +592,7 @@ impl Renderer {
         let model_matrix = mat4_to_array(&Mat4::IDENTITY);
         let light_dir = vec3_to_array(Vec3::new(0.5, 1.0, 0.3).normalize());
 
-        for submesh in &model.submeshes {
+        for submesh in model.submeshes.iter() {
             let material = model.materials.get(submesh.material_id as usize);
             let (diffuse, texture_index, double_sided) = match material {
                 Some(material) => (

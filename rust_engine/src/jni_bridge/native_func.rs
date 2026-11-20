@@ -442,6 +442,19 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_LoadModelPMD(
     0
 }
 
+/// Create a separate idle pose without opening any model or texture file.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ForkIdlePose(
+    _env: JNIEnv,
+    _class: JClass,
+    source: jlong,
+) -> jlong {
+    let model = MODELS.read().unwrap().get(&source).cloned();
+    let Some(model) = model else { return 0; };
+    let pose = model.lock().unwrap().fork_idle_pose();
+    register_model(pose.finish_idle_pose())
+}
+
 /// 删除模型
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_DeleteModel(

@@ -11,6 +11,7 @@ use super::{BoneLink, IkSolver};
 /// - 所有骨骼存储在连续数组中
 /// - 使用排序索引确保父骨骼先于子骨骼更新
 /// - 变换传播：local_to_world = parent.local_to_world * local_to_parent
+#[derive(Clone)]
 pub struct BoneSet {
     /// 骨骼数组
     links: Vec<BoneLink>,

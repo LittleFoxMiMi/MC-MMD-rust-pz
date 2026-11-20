@@ -109,6 +109,7 @@ impl MaterialMorphResult {
 }
 
 /// Morph 管理器
+#[derive(Clone)]
 pub struct MorphManager {
     morphs: Vec<Morph>,
     name_to_index: HashMap<String, usize>,

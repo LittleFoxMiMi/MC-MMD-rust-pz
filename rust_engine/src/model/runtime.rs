@@ -41,10 +41,10 @@ pub struct ModelVrDebugSnapshot {
 }
 
 struct WindowGeometrySource {
-    vertices: Vec<RuntimeVertex>,
-    weights: Vec<VertexWeight>,
-    morphs: Vec<Vec<(usize, Vec3)>>,
-    normal_morphs: Vec<Vec<(usize, Vec3)>>,
+    vertices: Arc<Vec<RuntimeVertex>>,
+    weights: Arc<Vec<VertexWeight>>,
+    morphs: Vec<Arc<Vec<crate::morph::VertexMorphOffset>>>,
+    normal_morphs: Vec<Arc<Vec<crate::morph::VertexMorphOffset>>>,
 }
 
 /// Owns every input to a secondary view. Evaluation never locks a live model.
@@ -69,8 +69,8 @@ impl WindowGeometryFrame {
             let b=self.effective.get(morph).copied().unwrap_or(0.0);
             let weight=a+(b-a)*alpha;
             if weight==0.0 {continue;}
-            for &(index,offset) in offsets {
-                if let Ok(slot)=indices.binary_search(&(index as i32)){positions[slot]+=offset*weight;}
+            for entry in offsets.iter() {
+                if let Ok(slot)=indices.binary_search(&(entry.vertex_index as i32)){positions[slot]+=entry.offset*weight;}
             }
         }
         for (slot,&index) in indices.iter().enumerate(){
@@ -88,8 +88,8 @@ impl WindowGeometryFrame {
         let mut positions: Vec<Vec3> = source.vertices.iter().map(|v| v.position).collect();
         for (offsets, &weight) in source.morphs.iter().zip(&self.effective) {
             if weight == 0.0 { continue; }
-            for &(index, offset) in offsets {
-                if let Some(p) = positions.get_mut(index) { *p += offset * weight; }
+            for entry in offsets.iter() {
+                if let Some(p) = positions.get_mut(entry.vertex_index as usize) { *p += entry.offset * weight; }
             }
         }
         let (pos, norm) = output.split_at_mut(count * 3);
@@ -128,14 +128,14 @@ pub struct MmdModel {
     pub vrm_metadata: String,
     pub(crate) vrm_material_render_states: Vec<i32>,
     pub(crate) vrm_expression_morphs: HashSet<usize>,
-    pub vertices: Vec<RuntimeVertex>,
-    pub indices: Vec<u32>,
-    pub weights: Vec<VertexWeight>,
-    pub materials: Vec<MmdMaterial>,
-    pub submeshes: Vec<SubMesh>,
-    pub texture_paths: Vec<String>,
-    pub rigid_bodies: Vec<mmd::pmx::rigid_body::RigidBody>,
-    pub joints: Vec<mmd::pmx::joint::Joint>,
+    pub vertices: Arc<Vec<RuntimeVertex>>,
+    pub indices: Arc<Vec<u32>>,
+    pub weights: Arc<Vec<VertexWeight>>,
+    pub materials: Arc<Vec<MmdMaterial>>,
+    pub submeshes: Arc<Vec<SubMesh>>,
+    pub texture_paths: Arc<Vec<String>>,
+    pub rigid_bodies: Arc<Vec<mmd::pmx::rigid_body::RigidBody>>,
+    pub joints: Arc<Vec<mmd::pmx::joint::Joint>>,
 
     // 运行时数据
     pub update_positions: Vec<Vec3>,
@@ -184,7 +184,8 @@ pub struct MmdModel {
     /// VRM 模型标志（影响坐标系处理）
     is_vrm: bool,
     vrm_runtime_state: Option<Box<VrmModelRuntimeState>>,
-    vrm_vmd_rest: Option<super::vrm_vmd::RestBasis>,
+    vrm_vmd_rest: Option<Arc<super::vrm_vmd::RestBasis>>,
+    vrm_extensions: Option<Arc<VrmExtensions>>,
 
     // 模型全局变换
     model_transform: Mat4,
@@ -325,14 +326,14 @@ impl MmdModel {
     pub fn new() -> Self {
         Self {
             name: String::new(),
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            weights: Vec::new(),
-            materials: Vec::new(),
-            submeshes: Vec::new(),
-            texture_paths: Vec::new(),
-            rigid_bodies: Vec::new(),
-            joints: Vec::new(),
+            vertices: Arc::default(),
+            indices: Arc::default(),
+            weights: Arc::default(),
+            materials: Arc::default(),
+            submeshes: Arc::default(),
+            texture_paths: Arc::default(),
+            rigid_bodies: Arc::default(),
+            joints: Arc::default(),
             update_positions: Vec::new(),
             update_normals: Vec::new(),
             update_uvs: Vec::new(),
@@ -366,6 +367,7 @@ impl MmdModel {
             is_vrm: false,
             vrm_runtime_state: None,
             vrm_vmd_rest: None,
+            vrm_extensions: None,
             vrm_metadata: String::new(),
             vrm_material_render_states: Vec::new(),
             vrm_expression_morphs: HashSet::new(),
@@ -435,6 +437,54 @@ impl MmdModel {
     }
 
     /// 获取顶点数量
+    /// Fresh animation, morph weights and physics using the loaded immutable assets.
+    pub(crate) fn fork_idle_pose(&self) -> Self {
+        let mut pose = Self::new();
+        pose.name = self.name.clone();
+        pose.set_vrm(self.is_vrm);
+        pose.vrm_material_render_states = self.vrm_material_render_states.clone();
+        pose.vrm_expression_morphs = self.vrm_expression_morphs.clone();
+        pose.window_geometry_source = self.window_geometry_source.clone();
+        pose.vertices = Arc::clone(&self.vertices);
+        pose.weights = Arc::clone(&self.weights);
+        pose.indices = Arc::clone(&self.indices);
+        pose.materials = Arc::clone(&self.materials);
+        pose.submeshes = Arc::clone(&self.submeshes);
+        pose.texture_paths = Arc::clone(&self.texture_paths);
+        pose.rigid_bodies = Arc::clone(&self.rigid_bodies);
+        pose.joints = Arc::clone(&self.joints);
+        pose.bone_manager = self.bone_manager.clone();
+        pose.morph_manager = self.morph_manager.clone();
+        pose.vrm_extensions = self.vrm_extensions.clone();
+        pose.vrm_vmd_rest = self.vrm_vmd_rest.clone();
+        pose
+    }
+
+    /// Allocate per-pose buffers and VRM simulation after releasing the source lock.
+    pub(crate) fn finish_idle_pose(mut self) -> Self {
+        let pose = &mut self;
+        pose.morph_manager.set_vertex_count(pose.vertices.len());
+        pose.morph_manager.set_material_count(pose.materials.len());
+        pose.update_positions = pose.vertices.iter().map(|vertex| vertex.position).collect();
+        pose.update_normals = pose.vertices.iter().map(|vertex| vertex.normal).collect();
+        pose.update_uvs = pose.vertices.iter().map(|vertex| vertex.uv).collect();
+        pose.init_material_visibility();
+        pose.initialize_animation();
+        pose.bone_manager.clear_physics_bone_indices();
+        pose.bone_manager.reset_all_ik_enabled();
+        pose.bone_manager.update_transforms(false);
+        pose.bone_manager.update_transforms(true);
+        pose.bone_manager.end_update();
+        if let Some(extensions) = &pose.vrm_extensions {
+            let extensions = extensions.as_ref().clone();
+            let mut runtime = VrmModelRuntimeState::new(pose, extensions);
+            runtime.initialize_output(pose);
+            pose.vrm_runtime_state = Some(Box::new(runtime));
+        }
+        pose.update();
+        self
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.vertices.len()
     }
@@ -566,7 +616,8 @@ impl MmdModel {
             return;
         }
 
-        self.vrm_vmd_rest = Some(super::vrm_vmd::RestBasis::from_bind(&self.bone_manager));
+        self.vrm_vmd_rest = Some(Arc::new(super::vrm_vmd::RestBasis::from_bind(&self.bone_manager)));
+        self.vrm_extensions = Some(Arc::new(extensions.clone()));
         let mut runtime_state = VrmModelRuntimeState::new(self, extensions);
         runtime_state.initialize_output(self);
         self.vrm_runtime_state = Some(Box::new(runtime_state));
@@ -781,7 +832,7 @@ impl MmdModel {
         // 3. 对每个子网格，按顶点位置判断是否在脖子以上
         self.head_submesh_flags = Vec::with_capacity(self.submeshes.len());
 
-        for submesh in &self.submeshes {
+        for submesh in self.submeshes.iter() {
             let begin = submesh.begin_index as usize;
             let count = submesh.index_count as usize;
 
@@ -949,7 +1000,7 @@ impl MmdModel {
             if weight == 0.0 { continue; }
             let Some(morph) = self.morph_manager.get_morph(index) else { continue; };
             if morph.morph_type != crate::morph::MorphType::Vertex { continue; }
-            for offset in &morph.vertex_offsets {
+            for offset in morph.vertex_offsets.iter() {
                 if let Some(position) = positions.get_mut(offset.vertex_index as usize) {
                     *position += offset.offset * weight;
                 }
@@ -974,17 +1025,16 @@ impl MmdModel {
         let source = self.window_geometry_source.get_or_insert_with(|| {
             let morphs = (0..self.morph_manager.morph_count()).map(|i| {
                 self.morph_manager.get_morph(i).filter(|m| m.morph_type == crate::morph::MorphType::Vertex)
-                    .map(|m| m.vertex_offsets.iter().map(|o| (o.vertex_index as usize, o.offset)).collect())
+                    .map(|m| m.vertex_offsets.clone())
                     .unwrap_or_default()
             }).collect();
-            let normal_morphs=(0..self.morph_manager.morph_count()).map(|i| self.morph_manager.get_morph(i).unwrap().normal_offsets.iter()
-                .map(|o| (o.vertex_index as usize,o.offset)).collect()).collect();
+            let normal_morphs=(0..self.morph_manager.morph_count()).map(|i| self.morph_manager.get_morph(i).unwrap().normal_offsets.clone()).collect();
             Arc::new(WindowGeometrySource { vertices: self.vertices.clone(), weights: self.weights.clone(), morphs, normal_morphs })
         }).clone();
         let mut effective = vec![0.0; self.morph_manager.morph_count()];
         self.morph_manager.compute_effective_weights_into(&mut effective);
         let mut normals:Vec<_>=if self.is_vrm {source.vertices.iter().map(|v|v.normal).collect()}else{Vec::new()};
-        for (offsets,&w) in source.normal_morphs.iter().zip(&effective) { if w!=0. { for &(i,n) in offsets { normals[i]+=n*w; } } }
+        for (offsets,&w) in source.normal_morphs.iter().zip(&effective) { if w!=0. { for entry in offsets.iter() { normals[entry.vertex_index as usize]+=entry.offset*w; } } }
         WindowGeometryFrame { source, matrices: self.camera_skinning_matrices().to_vec(), effective, normals }
     }
 
@@ -1233,7 +1283,7 @@ impl MmdModel {
         self.morph_manager.compute_effective_weights_into(&mut effective);
         for (i,w) in effective.into_iter().enumerate() {
             if w==0. {continue;}
-            for o in &self.morph_manager.get_morph(i).unwrap().normal_offsets { normals[o.vertex_index as usize]+=o.offset*w; }
+            for o in self.morph_manager.get_morph(i).unwrap().normal_offsets.iter() { normals[o.vertex_index as usize]+=o.offset*w; }
         }
         normals
     }
@@ -2089,7 +2139,7 @@ impl MmdModel {
         self.original_positions = Vec::with_capacity(vertex_count * 3);
         self.original_normals = Vec::with_capacity(vertex_count * 3);
 
-        for vertex in &self.vertices {
+        for vertex in self.vertices.iter() {
             self.original_positions.push(vertex.position.x);
             self.original_positions.push(vertex.position.y);
             self.original_positions.push(vertex.position.z);
@@ -2228,7 +2278,7 @@ impl MmdModel {
         for (morph_idx, &global_morph_idx) in self.vertex_morph_indices.iter().enumerate() {
             if let Some(morph) = self.morph_manager.get_morph(global_morph_idx) {
                 let base_offset = morph_idx * vertex_count * 3;
-                for offset in &morph.vertex_offsets {
+                for offset in morph.vertex_offsets.iter() {
                     let vid = offset.vertex_index as usize;
                     if vid < vertex_count {
                         let idx = base_offset + vid * 3;
@@ -2345,7 +2395,7 @@ impl MmdModel {
         for (morph_idx, &global_morph_idx) in self.uv_morph_indices.iter().enumerate() {
             if let Some(morph) = self.morph_manager.get_morph(global_morph_idx) {
                 let base_offset = morph_idx * vertex_count * 2;
-                for offset in &morph.uv_offsets {
+                for offset in morph.uv_offsets.iter() {
                     let vid = offset.vertex_index as usize;
                     if vid < vertex_count {
                         let idx = base_offset + vid * 2;
@@ -2706,7 +2756,7 @@ impl MmdModel {
                         self.morph_manager.set_morph_weight(index, weight);
                     }
                 }
-                super::vrm_vmd::evaluate(animation, *frame, *additive, self.vrm_vmd_rest.as_ref(),
+                super::vrm_vmd::evaluate(animation, *frame, *additive, self.vrm_vmd_rest.as_deref(),
                     &mut self.bone_manager, &mut self.morph_manager);
             } else if *additive {
                 animation.evaluate_additive(*frame, &mut self.bone_manager, &mut self.morph_manager);
@@ -3197,7 +3247,7 @@ impl MmdModel {
         // 对每个子网格，统计顶点的骨骼权重归属
         self.hand_submesh_flags = Vec::with_capacity(self.submeshes.len());
 
-        for submesh in &self.submeshes {
+        for submesh in self.submeshes.iter() {
             let begin = submesh.begin_index as usize;
             let count = submesh.index_count as usize;
             let mut left_weight_sum = 0.0f32;
@@ -3304,7 +3354,7 @@ impl MmdModel {
         total += (self.materials.capacity() * size_of::<MmdMaterial>()) as u64;
         total += (self.submeshes.capacity() * size_of::<SubMesh>()) as u64;
         // texture_paths: 每个 String 有堆分配
-        for s in &self.texture_paths {
+        for s in self.texture_paths.iter() {
             total += s.capacity() as u64;
         }
         total += (self.texture_paths.capacity() * size_of::<String>()) as u64;
@@ -3433,6 +3483,34 @@ mod tests {
         flip.group_offsets.push(GroupMorphOffset {morph_index: 0,influence: 0.75});
         model.morph_manager.add_morph(flip);
         model
+    }
+
+    #[test]
+    fn idle_pose_shares_assets_and_owns_animation_state() {
+        let mut source = MmdModel::new();
+        source.vertices = vec![RuntimeVertex {position: Vec3::ZERO, normal: Vec3::Y, uv: Vec2::ZERO}].into();
+        source.weights = vec![VertexWeight::Bdef1 {bone: -1}].into();
+        source.indices = vec![0, 0, 0].into();
+        source.materials = vec![MmdMaterial::default()].into();
+        source.texture_paths = vec!["texture.png".to_owned()].into();
+        let mut morph = crate::morph::Morph::new("expression".to_owned(), crate::morph::MorphType::Vertex);
+        morph.vertex_offsets = vec![crate::morph::VertexMorphOffset { vertex_index: 0, offset: Vec3::X }].into();
+        morph.set_weight(0.5);
+        source.morph_manager.add_morph(morph);
+        let mut idle = source.fork_idle_pose().finish_idle_pose();
+        assert!(Arc::ptr_eq(&source.vertices, &idle.vertices));
+        assert!(Arc::ptr_eq(&source.weights, &idle.weights));
+        assert!(Arc::ptr_eq(&source.indices, &idle.indices));
+        assert!(Arc::ptr_eq(&source.materials, &idle.materials));
+        assert!(Arc::ptr_eq(&source.texture_paths, &idle.texture_paths));
+        assert!(Arc::ptr_eq(&source.morph_manager.get_morph(0).unwrap().vertex_offsets,
+                           &idle.morph_manager.get_morph(0).unwrap().vertex_offsets));
+        assert_eq!(idle.morph_manager.get_morph_weight(0), 0.0);
+        idle.morph_manager.set_morph_weight(0, 1.0);
+        assert_eq!(source.morph_manager.get_morph_weight(0), 0.5);
+        drop(source);
+        idle.update();
+        assert_eq!(idle.vertex_count(), 1);
     }
 
     #[test]
@@ -3632,11 +3710,11 @@ mod tests {
     fn character_window_geometry_preserves_primary_pose_and_group_vertex_morphs() {
         use crate::morph::{Morph, MorphType, VertexMorphOffset, GroupMorphOffset};
         let mut model = make_neck_head_test_model("Neck", 0);
-        model.vertices = vec![RuntimeVertex {position: Vec3::new(0.1,1.8,0.2),normal: Vec3::Z,uv: Vec2::ZERO}];
-        model.weights = vec![VertexWeight::Bdef1{bone:1}];
+        model.vertices = vec![RuntimeVertex {position: Vec3::new(0.1,1.8,0.2),normal: Vec3::Z,uv: Vec2::ZERO}].into();
+        model.weights = vec![VertexWeight::Bdef1{bone:1}].into();
         model.update_positions = vec![Vec3::ZERO];model.update_normals=vec![Vec3::ZERO];model.update_uvs=vec![Vec2::ZERO];
         let mut vertex = Morph::new("face".into(),MorphType::Vertex);
-        vertex.vertex_offsets.push(VertexMorphOffset{vertex_index:0,offset:Vec3::new(0.1,0.2,0.3)});
+        Arc::make_mut(&mut vertex.vertex_offsets).push(VertexMorphOffset{vertex_index:0,offset:Vec3::new(0.1,0.2,0.3)});
         vertex.weight=0.25;
         model.morph_manager.add_morph(vertex);
         let mut group = Morph::new("group".into(),MorphType::Group);
@@ -3671,8 +3749,9 @@ mod tests {
             VertexWeight::Sdef{bones:[0,1],weight:0.4,c:Vec3::new(0.1,0.2,0.3),r0:Vec3::X,r1:Vec3::Y},
             VertexWeight::Qdef{bones:[0,1,0,1],weights:[0.1,0.2,0.3,0.4]}];
         let source=Arc::new(WindowGeometrySource{
-            vertices:(0..5).map(|i|RuntimeVertex{position:Vec3::new(i as f32,1.0,0.2),normal:Vec3::Y,uv:Vec2::ZERO}).collect(),
-            weights,normal_morphs:vec![],morphs:vec![vec![(1,Vec3::X),(3,Vec3::Z),(4,Vec3::Y)]]});
+            vertices:(0..5).map(|i|RuntimeVertex{position:Vec3::new(i as f32,1.0,0.2),normal:Vec3::Y,uv:Vec2::ZERO}).collect::<Vec<_>>().into(),
+            weights:weights.into(),normal_morphs:vec![],morphs:vec![vec![(1,Vec3::X),(3,Vec3::Z),(4,Vec3::Y)].into_iter()
+                .map(|(vertex_index,offset)| crate::morph::VertexMorphOffset {vertex_index,offset}).collect::<Vec<_>>().into()]});
         let a=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.2],normals:vec![Vec3::Y;5]};
         let b=WindowGeometryFrame{source:source.clone(),matrices:vec![Mat4::IDENTITY;2],effective:vec![0.8],normals:vec![Vec3::Y;5]};
         let live=vec![Mat4::from_rotation_translation(Quat::from_rotation_z(0.8),Vec3::X),
@@ -3681,7 +3760,7 @@ mod tests {
         assert!(b.evaluate_late_arms(&a,0.25,&ids,&live,&mut result));
         for (slot,&id) in ids.iter().enumerate(){
             let mut position=source.vertices[id as usize].position;
-            for &(index,offset) in &source.morphs[0]{if index==id as usize{position+=offset*0.35;}}
+            for entry in source.morphs[0].iter(){if entry.vertex_index==id as u32{position+=entry.offset*0.35;}}
             let (p,n)=compute_vertex_skinning(position,Vec3::Y,&source.weights[id as usize],&live);
             assert!(Vec3::from_slice(&result[slot*6..]).abs_diff_eq(Vec3::new(-p.x,p.y,p.z),1e-6));
             assert!(Vec3::from_slice(&result[slot*6+3..]).abs_diff_eq(Vec3::new(-n.x,n.y,n.z),1e-6));
@@ -3949,12 +4028,12 @@ mod tests {
             MmdMaterial::default(),
             MmdMaterial::default(),
             MmdMaterial::default(),
-        ];
+        ].into();
         model.submeshes = vec![
             SubMesh::new(0, 3, 0),
             SubMesh::new(3, 3, 1),
             SubMesh::new(6, 3, 2),
-        ];
+        ].into();
         model.head_submesh_flags = vec![false, true, false];
         model.head_detection_initialized = true;
         model
